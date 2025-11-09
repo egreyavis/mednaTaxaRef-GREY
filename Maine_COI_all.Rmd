@@ -1,7 +1,7 @@
 ---
 title: "Maine_COI_all"
 author: "Erin Grey"
-date: "2024-07-15"
+date: "2025-11-08"
 output: html_document
 ---
 
@@ -16,9 +16,9 @@ rm(list=ls())
 ```{r define_variables}
 entrez_key <- "7c5ac035201a1835b5a81de1b74ec8613d08" #GET YOUR OWN ENTREZ KEY AND PUT IT HERE!
 locus = "COI" #name of target locus, your choices are 
-output_folder <- "Maine_COI_all_2024-07-15" #name of your output folder every time
+output_folder <- "Maine_COI_2025-11-08" #name of your output folder every time
 species_list <- read.csv("workingfiles/GNRMaineSpecies_May2024.csv") # your species list
-species_list$search_name <- species_list$matched_name2 #define which column has the species names you want to search
+species_list$search_name <- species_list$species #define which column has the species names you want to search
 clade_list <- read.csv("workingfiles/EukaryoteFamilies_NCBI_2023-09-19.csv") # list of eukaryote families, change if necessary
 clade_level <- "order" # what taxonomic level do you want representatives for
 ```
@@ -40,7 +40,7 @@ if (!require("BiocManager", quietly = TRUE))
 BiocManager::install("genbankr")
 library(genbankr) ##genbankr is not functioning on latest Bioconductor, install locally instead
 set_entrez_key(entrez_key) #set the Entrez API key
-dir.create(output_folder)
+dir.create(output_folder) #create the output folder
 
 # create search terms for ENTREZ
 data(mtDNAterms) #AnnotationBustR's list of synonyms for different loci
