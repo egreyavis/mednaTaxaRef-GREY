@@ -26,7 +26,7 @@ clade_level <- "order" # what taxonomic level do you want representatives for,
 max_species_per_clade = 3 # how many representative species per missing clade? must be numeric
 
 species_list <- species_list[c(205:215, 12796, 639, 8902,9775),] ## SUBSET FOR TESTING
-clade_list <- clade_list[sample(nrow(clade_list), 50, replace=FALSE),] ## SUBSET FOR TESTING
+clade_list <- clade_list[sample(nrow(clade_list), 10, replace=FALSE),] ## SUBSET FOR TESTING
 ```
 
 ### LOAD PACKAGES ETC.
@@ -45,51 +45,42 @@ dir.create(output_folder) #create the output folder
 
 source("functions.R") #use the functions in this R script
 
-# Format clade_list to remove the _ID suffix from each taxonomy element
-setDT(clade_list)
-clade_tax_cols <- c("superkingdom","kingdom","phylum","class","order","family")
-clade_list[, (clade_tax_cols) := lapply(.SD, function(x) sub("_.*", "", x)), .SDcols = clade_tax_cols]
-
+# Get the locus search term
 data(mtDNAterms) #AnnotationBustR's list of synonyms for different loci
 mtDNAterms <- rbind(mtDNAterms, data.frame(Locus="rRNA_12S", Type="rRNA", Name= "small ribosomal RNA subunit RNA")) # adding other synonyms I've found
-is_mtgene <- locus %in% c("ATP6","ATP8","COI","COII","COIII","CYTB","ND1","ND2","ND3","ND4","ND4L","ND5","ND6") #check whether the locus is a gene or other feature, needed for the genome scraping
+is_mtgene <- locus %in% c("ATP6","ATP8","COI","COII","COIII","CYTB","ND1","ND2","ND3","ND4","ND4L","ND5","ND6") #is locus a gene? needed for scraping
 locus_synonyms <- mtDNAterms[mtDNAterms$Locus==locus,] #the target locus synonyms
 locus_synonyms$Terms <- paste0("OR ", locus_synonyms$Name, "[TITL]") # format for ENTREZ search terms
 locus_synonyms$Terms[1] <- paste0("AND (", locus_synonyms$Name[1], "[TITL]") # first term starts with "AND ("
 locus_synonyms$Terms[dim(locus_synonyms)[1]] <- paste0("OR ", locus_synonyms$Name[dim(locus_synonyms)[1]], "[TITL])") #last term ends with a ")"
 locus_searchterm <- paste(as.vector(locus_synonyms$Terms), collapse=" ") # the big ENTREZ locus search term
 print(locus_searchterm)
-```
 
-### GET SPECIES TAXONOMIES AND IDENTFY MISSING CLADES
-```{r getTaxonomiesAndMissingClades}
-
-tax_df <- species_list[,c("superkingdom", "kingdom", "phylum", "class", "order", "family", "genus", "species", "taxon_id")]
+# Add the taxonomy ids to the names
+tax_df <- add_taxids_to_taxonomy(species_list)
+tax_df <- tax_df[,c("superkingdom", "kingdom", "phylum", "class", "order", "family", "genus", "species")]
 tax_df <- tax_df[tax_df$species != "na",] # remove any taxa without species names
-clades_tax_df <- unique(tax_df[,clade_level]) 
-
-clade_uniques <- clade_list[!duplicated(clade_list[, ..clade_level]),] # deduplicate the clade of interest in the list
-clade_uniques <- clade_uniques[clade_uniques$order != "character(0)",] # remove any undefined clades
-clades_missing <- clade_uniques[!(get(clade_level) %in% clades_tax_df), 
-                                .(superkingdom, kingdom, phylum, class, order)] #clades not represented in the tax_df
-clades_missing$spp_list <- NA
-
+tax_df <- backfill_missing_ranks(tax_df)
+head(tax_df) # check format
 ```
 
+### IDENTFY MISSING CLADES
+```{r getTaxonomiesAndMissingClades}
+clades_tax_df <- unique(tax_df[[clade_level]]) 
+setDT(clade_list)
+clade_uniques <- clade_list[!duplicated(clade_list[, ..clade_level]),] # deduplicate the clade of interest in the list
+clades_missing <- clade_uniques[!(get(clade_level) %in% clades_tax_df), .(superkingdom, kingdom, phylum, class, order)] #clades not represented in the tax_df
+clades_missing$spp_list <- NA
+```
 
 ### GET SPECIES REPRESENTATIVES FOR MISSNG CLADES
-```{r getMissingCladeSpecies_optional, warnings=FALSE}
-
-suppressWarnings({
-  clade_seqs <- process_missing_clades(
+```{r getMissingCladeSpecies_optional}
+clade_seqs <- process_missing_clades(
   clades_missing = clades_missing,
-  target_locus_searchterm = locus_searchterm,
+  locus_searchterm = locus_searchterm,
   rank_column = clade_level,
   max_species_per_clade = max_species_per_clade
   )
-})
-
-#tax_df <- merge(tax_df, clade_seqs)
 
 ```
 
@@ -100,42 +91,57 @@ setDT(tax_df) # Convert to data.table for faster processing
 # Process all species and update data.table by reference
 cat("Searching GenBank for", nrow(tax_df), "species\n")
 
-for (i in 1:nrow(tax_df)) {
+results_list <- lapply(1:nrow(tax_df), function(i) {
   cat("\rFinding GenBank accessions & mitogenomes for species", i, "of", nrow(tax_df))
   
-  result <- search_species_accessions(
-    species_name = tax_df$search_name[i],
+  search_species_accessions(
+    species_row = tax_df[i, ],
     locus_searchterm = locus_searchterm,
     delay = 0.35
   )
-  
-  # Update by reference (very fast with data.table)
-  tax_df[i, `:=`(
-    n_mitogenome = result$n_mitogenome,
-    ids_mitogenome = result$ids_mitogenome,
-    n_target = result$n_target,
-    ids_target = result$ids_target
-  )]
-}
+})
 
 cat("\n")
-colnames(clade_seqs) <- c("order","family","genus","species","taxon_id","ids_mitogenome","ids_target","n_mitogenome","n_target","tax_query")
 
-colnames(tax_df) <- c("superkingdom","kingdom","phylum","class","order","family", "genus","species","taxon_id", "n_mitogenome", "ids_mitogenome", "n_target", "ids_target" )
-fwrite(tax_df, file.path(output_folder, "tax_accessions.csv")) # Save results
+# Convert results_list to data.frame
+results_df <- rbindlist(lapply(results_list, function(x) {
+  data.frame(
+    n_mitogenome = x$n_mitogenome,
+    ids_mitogenome = x$ids_mitogenome,
+    n_target = x$n_target,
+    ids_target = x$ids_target,
+    stringsAsFactors = FALSE
+  )
+}), fill = TRUE)
+
+# Add the search results to tax_df
+tax_df$n_mitogenome <- results_df$n_mitogenome
+tax_df$ids_mitogenome <- results_df$ids_mitogenome
+tax_df$n_target <- results_df$n_target
+tax_df$ids_target <- results_df$ids_target
+
+# Now combine with clade_seqs
+setDT(tax_df)
+setDT(clade_seqs)
+
+# Make sure both have the same columns
+tax_df <- rbind(tax_df, clade_seqs, fill = TRUE)
+
+# Save results
+fwrite(tax_df, file.path(output_folder, "tax_accessions.csv"))
 
 cat("Complete! Saved results to tax_accessions.csv\n")
 
 ```
 
 ### GET ACCESSIONS
-```{r scrape_accessions}
-cat("Scraping accessions for", nrow(tax_df), "species\n")
+```{r fetch_accessions}
+cat("Fetching accessions for", nrow(tax_df), "species\n")
 
-REFDB <- rbindlist(lapply(1:nrow(tax_df), function(i) {
-  cat("\rScraping accessions for species", i, "of", nrow(tax_df))
+REFDB_accessions <- rbindlist(lapply(1:nrow(tax_df), function(i) {
+  cat("\rFetching accessions for species", i, "of", nrow(tax_df))
   
-  result <- scrape_species_accessions(
+  result <- fetch_species_accessions(
     species_row = as.list(tax_df[i, ]),
     locus = locus,
     output_folder = output_folder,
@@ -147,7 +153,7 @@ REFDB <- rbindlist(lapply(1:nrow(tax_df), function(i) {
   return(result)
 }), fill = TRUE)
 
-cat("\nComplete! Scraped", nrow(REFDB), "sequences\n")
+cat("\nComplete! Scraped", nrow(REFDB_accessions), "sequences\n")
 
 ```
 
@@ -155,29 +161,32 @@ cat("\nComplete! Scraped", nrow(REFDB), "sequences\n")
 ```{r scrape_mitogenomes}
 setDT(tax_df) # Convert to data.table for faster operations
 
-REFDB <- rbindlist(lapply(1:nrow(tax_df), function(i) {
+REFDB_scrapes <- rbindlist(lapply(1:nrow(tax_df), function(i) {
   cat("\rSpecies", i, "of", nrow(tax_df))
   
   process_species_mitogenomes(
     as.list(tax_df[i, ]), 
-    target_synonyms = locus_synonyms,
+    target_synonyms = locus_synonyms$Name,
     is_gene = is_mtgene,
     max_mitos = 20
   )
 }), fill = TRUE)
 
-REFDB <- REFDB[!is.na(sequence)] # Remove rows with NA sequences
-cat("\nComplete! Processed", nrow(REFDB), "sequences\n")
+REFDB_scrapes <- REFDB_scrapes[!is.na(sequence)] # Remove rows with NA sequences
+cat("\nComplete! Processed", nrow(REFDB_scrapes), "sequences\n")
+
+REFDB_all <- rbind(REFDB_accessions, REFDB_scrapes)
+REFDB_all <- merge(REFDB_all, tax_df[,c("superkingdom","kingdom","phylum","class","order","family","genus","species")], by="species", all.x=TRUE)
 ```
 
 ## De-duplicate the reference database, but keep track of duplicates in original species_list
 ```{r remove_duplicates}
 
-setDT(REFDB) # Convert to data.table
-REFDB_unique <- REFDB[!duplicated(sequence)] # Remove duplicates while keeping first occurrence
+setDT(REFDB_all) # Convert to data.table
+REFDB_unique <- REFDB_all[!duplicated(sequence)] # Remove duplicates while keeping first occurrence
 
 # Aggregate duplicates - MUCH faster than looping
-duplicate_summary <- REFDB[, .(
+duplicate_summary <- REFDB_all[, .(
   duplicate_accessions = paste(seq_accession, collapse = "|"),
   duplicate_species = paste(unique(species), collapse = "|")
 ), by = sequence]
@@ -190,61 +199,97 @@ REFDB_unique <- merge(
   all.x = TRUE
 )
 
-fwrite(REFDB_unique, file.path(output_folder, "a03_UniqueRefDB.csv")) # Save results
+fwrite(REFDB_unique, file.path(output_folder, "REFDB_unique.csv")) # Save results
 
 cat("Saved", nrow(REFDB_unique), "unique sequences\n")
 
 ```
 
-## Format REFDB for dada2 assignTaxonomy()
-```{r format_dada2}
-a04_UNIQUEDBdada <- merge(x=a03_UNIQUEDB, y=a01_NAMES, by.x="species", by.y="search_name", all.x=TRUE, all.y=FALSE) 
-my_cols <- c("phylum", "class","order","family","genus","species.y")
-a04_UNIQUEDBdada$header <- do.call(paste, c(a04_UNIQUEDBdada[my_cols], sep = ";"))
-a04_UNIQUEDBdada$header2 <- paste(">",a04_UNIQUEDBdada$header, sep="")
-REFDB_dada <- a04_UNIQUEDBdada[,c("header2","sequence")]
-write.table(REFDB_dada, file.path(output_folder, "a04_REFDBdada.fasta"), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
-```
-
-
 ## Summarize ref sequence results for species in the original list
 ```{r summarize_species}
-#Count reference sequences by species
-counts_species <- as.data.frame(table(a03_UNIQUEDB$species)) #count the number of unique reference sequences per species
-colnames(counts_species) <- c("species", "n_unique_seqs") #format
-a01_NAMES <- merge(a01_NAMES, counts_species, by.x= "search_name", by.y="species", all.x=TRUE, all.y=TRUE) # update the summary database with reference sequence counts
-a00_SPECIES_SUMMARY <- a01_NAMES[a01_NAMES$search_name %in% species_list$search_name,]
 
-#add in duplicates information to BESTNAMES
-a00_SPECIES_SUMMARY$dup_accessions <- "na"
-a00_SPECIES_SUMMARY$dup_species <- "na"
-a00_SPECIES_SUMMARY$dup_species_n <- "na"
+setDT(species_list)
+setDT(REFDB_unique)
 
-for (b in 1:dim(a00_SPECIES_SUMMARY)[1]){
-  dup_accessions <- paste(a03_UNIQUEDB[a03_UNIQUEDB$species == a00_SPECIES_SUMMARY$search_name[b], "duplicate_accessions"], collapse="|")
-  dup_accessions <- unlist(strsplit(dup_accessions, split="\\|"))
-  dup_accessions_unique <- paste(unique(dup_accessions), collapse="|")
-  
-  dup_species <- paste(a03_UNIQUEDB[a03_UNIQUEDB$species == a00_SPECIES_SUMMARY$search_name[b], "duplicate_species"], collapse="|")
-  dup_species <- unlist(strsplit(dup_species, split="\\|"))
-  dup_species_unique <- unique(dup_species)
-  
-    if (length(dup_accessions)>0){
-  a00_SPECIES_SUMMARY$dup_accessions[b]<-dup_accessions_unique
-  a00_SPECIES_SUMMARY$dup_species[b]<- paste(dup_species_unique, collapse="|")
-  a00_SPECIES_SUMMARY$dup_species_n[b]<- length(dup_species_unique)
+# Format species_list
+species_list[, species_id := paste0(matched_name2, "_", taxon_id)]
+
+# Aggregate all information from REFDB_unique in one step
+agg_info <- REFDB_unique[, .(
+  n_unique_seqs = .N,
+  n_target = sum(type == "accession"),
+  n_mitogenome = sum(type == "scrape"),
+  dup_accessions = paste(unique(unlist(strsplit(paste(duplicate_accessions, collapse = "|"), "\\|"))), collapse = "|"),
+  dup_species = {
+    all_dup <- unlist(strsplit(paste(duplicate_species, collapse = "|"), "\\|"))
+    paste(unique(all_dup), collapse = "|")
+  },
+  dup_species_n = {
+    all_dup <- unlist(strsplit(paste(duplicate_species, collapse = "|"), "\\|"))
+    length(unique(all_dup))
   }
-  
-  #reset variables
-  rm(dup_accessions)
-  rm(dup_species)
-}
-a00_SPECIES_SUMMARY$n_target <- as.numeric(a00_SPECIES_SUMMARY$n_target)
+), by = species]
 
-a00_SPECIES_SUMMARY$n_all_seqs <- a00_SPECIES_SUMMARY$n_mitogenome + a00_SPECIES_SUMMARY$n_target
-n_species_withnames <- dim(a00_SPECIES_SUMMARY)[1]
-n_species_withnamesANDtargets <- length(which(a00_SPECIES_SUMMARY$n_all_seqs>0))
-write.csv(a00_SPECIES_SUMMARY, file.path(output_folder, "a00_SPECIES_SUMMARY.csv"), row.names=FALSE)
+# Merge with species_list
+species_summary <- merge(species_list, agg_info, 
+                        by.x = "species_id", by.y = "species", 
+                        all.x = TRUE)
 
-n_species_withnames; n_species_withnamesANDtargets
+# Handle NAs
+species_summary[is.na(n_unique_seqs), n_unique_seqs := 0]
+species_summary[is.na(n_target), n_target := 0]
+species_summary[is.na(n_mitogenome), n_mitogenome := 0]
+species_summary[is.na(dup_accessions), dup_accessions := "na"]
+species_summary[is.na(dup_species), dup_species := "na"]
+species_summary[is.na(dup_species_n), dup_species_n := 0]
+
+# Calculate total sequences
+species_summary[, n_all_seqs := n_mitogenome + n_target]
+
+# Summary stats
+n_species_withnames <- nrow(species_summary)
+n_species_withNCBInames <-  species_summary[data_source_title == "National Center for Biotechnology Information", .N]
+n_species_withNCBInamesANDtargets <- species_summary[data_source_title == "National Center for Biotechnology Information" & n_all_seqs > 0, .N]
+n_species_justAccessions <- species_summary[n_target > 0 & n_mitogenome == 0, .N]
+n_species_justMitogenomes <- species_summary[n_target == 0 & n_mitogenome > 0, .N]
+n_species_bothAccessionsAndMitogenomes <- species_summary[n_target > 0 & n_mitogenome > 0, .N]
+
+# Save results
+fwrite(species_summary, file.path(output_folder, "species_list_summary.csv"))
+
+# Print results
+cat("Saved species_list_summary.csv\n")
+cat("Species in the list:", n_species_withnames, "\n")
+cat("Species with NCBI names:", n_species_withNCBInames, "\n")
+cat("Species with NCBI names AND targets:", n_species_withNCBInamesANDtargets, "\n")
+cat("Species with only Accessions:", n_species_justAccessions, "\n")
+cat("Species with only Mitogenomes:", n_species_justMitogenomes, "\n")
+cat("Species with Accessions & Mitogenomes:", n_species_bothAccessionsAndMitogenomes, "\n")
+```
+
+## Format REFDB for dada2 assignTaxonomy()
+```{r format_dada2_optional}
+
+REFDB_unique_dada <- merge(x=REFDB_unique, y=tax_df, by="species", all=TRUE) 
+REFDB_unique_dada <- REFDB_unique_dada[!is.na(REFDB_unique_dada$sequence),]
+
+# Create header column with ">" at the beginning
+REFDB_unique_dada[, header := paste0(
+  ">",
+  paste(
+    ifelse(is.na(kingdom.x), "", kingdom.x),
+    ifelse(is.na(phylum.x), "", phylum.x),
+    ifelse(is.na(class.x), "", class.x),
+    ifelse(is.na(order.x), "", order.x),
+    ifelse(is.na(family.x), "", family.x),
+    ifelse(is.na(genus.x), "", genus.x),
+    ifelse(is.na(species), "", species),
+    sep = ";"
+  )
+)]
+
+REFDB_unique_dada <- REFDB_unique_dada[,c("header","sequence")]
+write.table(REFDB_unique_dada, file.path(output_folder, "REFDB_unique_dada.fasta"), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
+
+cat("Saved dada reference library with", nrow(REFDB_unique_dada), "sequences across", length(unique(REFDB_unique_dada$header)), "species\n")
 ```
