@@ -131,7 +131,7 @@ setDT(clade_seqs)
 tax_df <- rbind(tax_df, clade_seqs, fill = TRUE)
 
 # Save results
-fwrite(tax_df, file.path(output_folder, "tax_accessions.csv"))
+fwrite(tax_df, file.path(output_folder, paste0("tax_accessions_", locus, "_", Sys.Date(),".csv")))
 
 cat("Complete! Saved results to tax_accessions.csv\n")
 
@@ -202,7 +202,8 @@ REFDB_unique <- merge(
   all.x = TRUE
 )
 
-fwrite(REFDB_unique, file.path(output_folder, "REFDB_unique.csv")) # Save results
+fwrite(REFDB_unique, file.path(output_folder, paste0("REFDB_unique_", locus, "_", Sys.Date(),".csv"))) # Save results
+
 
 cat("Saved", nrow(REFDB_unique), "unique sequences\n")
 
@@ -258,7 +259,7 @@ n_species_justMitogenomes <- species_summary[n_target == 0 & n_mitogenome > 0, .
 n_species_bothAccessionsAndMitogenomes <- species_summary[n_target > 0 & n_mitogenome > 0, .N]
 
 # Save results
-fwrite(species_summary, file.path(output_folder, "species_list_summary.csv"))
+fwrite(species_summary, file.path(output_folder, paste0("species_list_summary_", locus, "_", Sys.Date(),".csv")))
 
 # Print results
 cat("Saved species_list_summary.csv\n")
@@ -292,7 +293,7 @@ REFDB_unique_dada[, header := paste0(
 )]
 
 REFDB_unique_dada <- REFDB_unique_dada[,c("header","sequence")]
-write.table(REFDB_unique_dada, file.path(output_folder, "REFDB_unique_dada.fasta"), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
+write.table(REFDB_unique_dada, file.path(output_folder, paste0("REFDB_unique_dada_", locus, "_", Sys.Date(),".fasta"), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
 
 cat("Saved dada reference library with", nrow(REFDB_unique_dada), "sequences across", length(unique(REFDB_unique_dada$header)), "species\n")
 ```
