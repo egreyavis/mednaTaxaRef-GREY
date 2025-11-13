@@ -25,8 +25,8 @@ clade_list <- read.csv("workingfiles/EukaryoteFamilies_NCBI_2023-09-19.csv") # l
 clade_level <- "order" # what taxonomic level do you want representatives for, 
 max_species_per_clade = 3 # how many representative species per missing clade? must be numeric
 
-species_list <- species_list[c(205:215, 12796, 639, 8902,9775),] ## SUBSET FOR TESTING
-clade_list <- clade_list[sample(nrow(clade_list), 10, replace=FALSE),] ## SUBSET FOR TESTING
+#species_list <- species_list[c(205:215, 12796, 639, 8902,9775),] ## SUBSET FOR TESTING
+#clade_list <- clade_list[sample(nrow(clade_list), 10, replace=FALSE),] ## SUBSET FOR TESTING
 ```
 
 ### LOAD PACKAGES ETC.
@@ -66,15 +66,18 @@ head(tax_df) # check format
 
 ### IDENTFY MISSING CLADES
 ```{r getTaxonomiesAndMissingClades}
+
 clades_tax_df <- unique(tax_df[[clade_level]]) 
 setDT(clade_list)
 clade_uniques <- clade_list[!duplicated(clade_list[, ..clade_level]),] # deduplicate the clade of interest in the list
 clades_missing <- clade_uniques[!(get(clade_level) %in% clades_tax_df), .(superkingdom, kingdom, phylum, class, order)] #clades not represented in the tax_df
 clades_missing$spp_list <- NA
+
 ```
 
 ### GET SPECIES REPRESENTATIVES FOR MISSNG CLADES
 ```{r getMissingCladeSpecies_optional}
+
 clade_seqs <- process_missing_clades(
   clades_missing = clades_missing,
   locus_searchterm = locus_searchterm,
