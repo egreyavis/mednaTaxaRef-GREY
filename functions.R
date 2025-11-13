@@ -2,13 +2,117 @@ library(rentrez)
 library(Biostrings)
 library(data.table)
 
+################# SPECIES LIST PROCESSING
+# Helper function to add taxid to taxonomy
+add_taxids_to_taxonomy <- function(species_df) {
+  
+  setDT(species_df)
+  
+  # Function to get taxid for a rank
+  get_rank_taxid <- function(i, rank_name) {
+    path <- species_df$classification_path[i]
+    path_ranks <- species_df$classification_path_ranks[i]
+    path_ids <- species_df$classification_path_ids[i]
+    
+    names <- strsplit(path, "\\|")[[1]]
+    ranks <- strsplit(path_ranks, "\\|")[[1]]
+    ids <- strsplit(path_ids, "\\|")[[1]]
+    
+    rank_idx <- which(ranks == rank_name)
+    
+    if (length(rank_idx) > 0) {
+      return(ids[rank_idx[1]])
+    }
+    return(NA_character_)
+  }
+  
+  # Create new data.table with correct number of rows
+  result <- data.table(
+    superkingdom = rep(NA_character_, nrow(species_df)),
+    kingdom = rep(NA_character_, nrow(species_df)),
+    phylum = rep(NA_character_, nrow(species_df)),
+    class = rep(NA_character_, nrow(species_df)),
+    order = rep(NA_character_, nrow(species_df)),
+    family = rep(NA_character_, nrow(species_df)),
+    genus = rep(NA_character_, nrow(species_df)),
+    species = rep(NA_character_, nrow(species_df))
+  )
+  
+  for (i in 1:nrow(species_df)) {
+    
+    # For each taxonomic rank
+    for (rank in c("superkingdom", "kingdom", "phylum", "class", "order", "family", "genus")) {
+      name_val <- species_df[[rank]][i]
+      
+      if (!is.na(name_val) && name_val != "na" && name_val != "") {
+        taxid <- get_rank_taxid(i, rank)
+        if (!is.na(taxid)) {
+          result[i, (rank) := paste0(name_val, "_", taxid)]
+        }
+      }
+    }
+    
+    # Species uses taxon_id directly
+    species_name <- species_df$species[i]
+    if (!is.na(species_name) && species_name != "na" && species_name != "") {
+      result[i, species := paste0(species_name, "_", species_df$taxon_id[i])]
+    }
+  }
+  
+  return(result)
+}
+
+# Backfill taxonomy ranks that are NA
+backfill_missing_ranks <- function(taxonomy_df) {
+  
+  setDT(taxonomy_df)
+  
+  rank_hierarchy <- c("superkingdom", "kingdom", "phylum", "class", "order", "family", "genus", "species")
+  
+  for (i in 1:nrow(taxonomy_df)) {
+    for (j in 1:(length(rank_hierarchy) - 1)) {
+      current_rank <- rank_hierarchy[j]
+      next_rank <- rank_hierarchy[j + 1]
+      
+      # If current rank is NA but next rank exists
+      current_val <- taxonomy_df[i, get(current_rank)]
+      next_val <- taxonomy_df[i, get(next_rank)]
+      
+      if ((is.na(current_val) || current_val == "") && !is.na(next_val) && next_val != "") {
+        taxonomy_df[i, (current_rank) := paste0(next_rank, "_", next_val)]
+      }
+    }
+  }
+  
+  return(taxonomy_df)
+}
+
+
 ########### ACCESSION FINDING AND DOWNLOADING FUNCTIONS #######################
 # Function to search Genbank for accessions by species and locus
-search_species_accessions <- function(species_name, locus_searchterm, delay = 0.35) {
+search_species_accessions <- function(species_row, locus_searchterm, delay = 0.35) {
   
-  search_name <- paste0(species_name, "[ORGN]")
-  mito_term <- paste(search_name, "AND mitochondrion[TITL] AND complete genome[TITL]")
-  target_term <- paste(search_name, locus_searchterm)
+  # Extract taxid from species field (format: "Species name_taxid")
+  species_info <- species_row$species
+  
+  # Split to get taxid
+  taxid <- strsplit(species_info, "_")[[1]]
+  taxid <- taxid[length(taxid)]  # Get last element in case species name has underscores
+  
+  if (is.na(taxid) || taxid == "" || taxid == "na") {
+    warning(paste("No valid taxid found for", species_info))
+    return(list(
+      n_mitogenome = 0,
+      ids_mitogenome = NA_character_,
+      n_target = 0,
+      ids_target = NA_character_
+    ))
+  }
+  
+  # Format search terms using taxid
+  search_term <- paste0("txid", taxid, "[Organism]")
+  mito_term <- paste(search_term, "AND mitochondrion[TITL] AND complete genome[TITL]")
+  target_term <- paste(search_term, locus_searchterm)
   
   result <- list(
     n_mitogenome = 0,
@@ -17,9 +121,13 @@ search_species_accessions <- function(species_name, locus_searchterm, delay = 0.
     ids_target = NA_character_
   )
   
+  # Search for mitogenomes
   mitogenomes <- tryCatch({
     entrez_search(db = "nucleotide", term = mito_term, retmax = 9999)
-  }, error = function(e) NULL)
+  }, error = function(e) {
+    warning(paste("Mitogenome search failed for taxid", taxid, ":", e$message))
+    return(NULL)
+  })
   
   if (!is.null(mitogenomes)) {
     result$n_mitogenome <- mitogenomes$count
@@ -30,9 +138,13 @@ search_species_accessions <- function(species_name, locus_searchterm, delay = 0.
   
   Sys.sleep(delay)
   
+  # Search for target locus accessions
   targets <- tryCatch({
     entrez_search(db = "nucleotide", term = target_term, retmax = 9999)
-  }, error = function(e) NULL)
+  }, error = function(e) {
+    warning(paste("Target search failed for taxid", taxid, ":", e$message))
+    return(NULL)
+  })
   
   if (!is.null(targets)) {
     result$n_target <- targets$count
@@ -43,7 +155,6 @@ search_species_accessions <- function(species_name, locus_searchterm, delay = 0.
   
   return(result)
 }
-
 
 ########### PROCESS MISSING CLADES ####################
 # Function to get species list for a clade using NCBI Taxonomy
@@ -58,9 +169,11 @@ get_clade_species <- function(clade_id, max_species = 1000) {
     )
     
     if (length(search_result$ids) == 0) {
+      warning(paste("No species found for clade", clade_id))
       return(NULL)
     }
     
+    cat(paste(" [Found", length(search_result$ids), "species]"))
     return(search_result$ids)
     
   }, error = function(e) {
@@ -69,8 +182,110 @@ get_clade_species <- function(clade_id, max_species = 1000) {
   })
 }
 
+# Improved function to extract taxonomy with better XML parsing
+extract_taxonomy <- function(species_id) {
+  
+  # Fetch full classification using efetch
+  classification <- tryCatch({
+    entrez_fetch(db = "taxonomy", id = species_id, rettype = "xml")
+  }, error = function(e) {
+    warning(paste("Failed to fetch taxonomy for", species_id))
+    return(NULL)
+  })
+  
+  if (is.null(classification)) {
+    return(list(family = NA, family_id = NA, genus = NA, genus_id = NA, 
+                species = NA, species_id = species_id))
+  }
+  
+  # Initialize results
+  family <- NA
+  family_id <- NA
+  genus <- NA
+  genus_id <- NA
+  species <- NA
+  
+  # Split into lines for parsing
+  lines <- strsplit(classification, "\n")[[1]]
+  
+  # Find each Lineage entry with Rank and extract name and TaxId
+  i <- 1
+  while (i <= length(lines)) {
+    
+    # Look for family rank
+    if (grepl("<Rank>family</Rank>", lines[i])) {
+      # Search backwards and forwards for ScientificName and TaxId within same LineageEx block
+      start_idx <- max(1, i - 15)
+      end_idx <- min(length(lines), i + 5)
+      
+      for (j in start_idx:end_idx) {
+        if (grepl("<ScientificName>", lines[j]) && is.na(family)) {
+          family <- sub(".*<ScientificName>([^<]+)</ScientificName>.*", "\\1", lines[j])
+          family <- trimws(family)
+        }
+        if (grepl("<TaxId>", lines[j]) && is.na(family_id) && j < i) {
+          family_id <- sub(".*<TaxId>([^<]+)</TaxId>.*", "\\1", lines[j])
+          family_id <- trimws(family_id)
+        }
+      }
+    }
+    
+    # Look for genus rank
+    if (grepl("<Rank>genus</Rank>", lines[i])) {
+      start_idx <- max(1, i - 15)
+      end_idx <- min(length(lines), i + 5)
+      
+      for (j in start_idx:end_idx) {
+        if (grepl("<ScientificName>", lines[j]) && is.na(genus)) {
+          genus <- sub(".*<ScientificName>([^<]+)</ScientificName>.*", "\\1", lines[j])
+          genus <- trimws(genus)
+        }
+        if (grepl("<TaxId>", lines[j]) && is.na(genus_id) && j < i) {
+          genus_id <- sub(".*<TaxId>([^<]+)</TaxId>.*", "\\1", lines[j])
+          genus_id <- trimws(genus_id)
+        }
+      }
+    }
+    
+    # Look for species rank - the main ScientificName at the top
+    if (grepl("<Rank>species</Rank>", lines[i]) && is.na(species)) {
+      start_idx <- max(1, i - 15)
+      
+      for (j in start_idx:i) {
+        if (grepl("<ScientificName>", lines[j])) {
+          species <- sub(".*<ScientificName>([^<]+)</ScientificName>.*", "\\1", lines[j])
+          species <- trimws(species)
+          break
+        }
+      }
+    }
+    
+    i <- i + 1
+  }
+  
+  # If species is still NA, try to get it from the main taxonomy record
+  if (is.na(species)) {
+    for (line in lines) {
+      if (grepl("^\\s*<ScientificName>", line)) {
+        species <- sub(".*<ScientificName>([^<]+)</ScientificName>.*", "\\1", line)
+        species <- trimws(species)
+        break
+      }
+    }
+  }
+  
+  return(list(
+    family = family,
+    family_id = family_id,
+    genus = genus,
+    genus_id = genus_id,
+    species = species,
+    species_id = species_id
+  ))
+}
+
 # Function to search for sequences (mitogenome first, then target)
-search_species_sequences <- function(species_id, target_locus_searchterm) {
+search_species_sequences <- function(species_id, locus_searchterm) {
   
   tax_query <- paste0("txid", species_id, "[Organism]")
   
@@ -102,7 +317,7 @@ search_species_sequences <- function(species_id, target_locus_searchterm) {
   targets <- tryCatch({
     entrez_search(
       db = "nucleotide",
-      term = paste(tax_query, target_locus_searchterm),
+      term = paste(tax_query, locus_searchterm),
       retmax = 9999
     )
   }, error = function(e) NULL)
@@ -164,69 +379,10 @@ get_taxonomy_info <- function(species_ids) {
   return(tax_list)
 }
 
-# Function to extract taxonomic ranks from lineage
-extract_taxonomy <- function(species_id) {
-  
-  # Fetch full classification
-  classification <- tryCatch({
-    entrez_fetch(db = "taxonomy", id = species_id, rettype = "xml")
-  }, error = function(e) {
-    return(NULL)
-  })
-  
-  if (is.null(classification)) {
-    return(list(family = NA, genus = NA, species = NA))
-  }
-  
-  # Parse XML to extract ranks (simple text parsing)
-  lines <- strsplit(classification, "\n")[[1]]
-  
-  family <- NA
-  genus <- NA
-  species <- NA
-  
-  # Look for rank tags
-  for (line in lines) {
-    if (grepl("<Rank>family</Rank>", line)) {
-      # Get scientific name from nearby lines
-      sci_line_idx <- which(lines == line)
-      for (j in (sci_line_idx - 5):(sci_line_idx + 5)) {
-        if (grepl("<ScientificName>", lines[j])) {
-          family <- gsub(".*<ScientificName>([^<]+)</ScientificName>.*", "\\1", lines[j])
-          family <- trimws(family)
-          break
-        }
-      }
-    }
-    if (grepl("<Rank>genus</Rank>", line)) {
-      sci_line_idx <- which(lines == line)
-      for (j in (sci_line_idx - 5):(sci_line_idx + 5)) {
-        if (grepl("<ScientificName>", lines[j])) {
-          genus <- gsub(".*<ScientificName>([^<]+)</ScientificName>.*", "\\1", lines[j])
-          genus <- trimws(genus)
-          break
-        }
-      }
-    }
-    if (grepl("<Rank>species</Rank>", line)) {
-      sci_line_idx <- which(lines == line)
-      for (j in (sci_line_idx - 5):(sci_line_idx + 5)) {
-        if (grepl("<ScientificName>", lines[j])) {
-          species <- gsub(".*<ScientificName>([^<]+)</ScientificName>.*", "\\1", lines[j])
-          species <- trimws(species)
-          break
-        }
-      }
-    }
-  }
-  
-  return(list(family = family, genus = genus, species = species))
-}
-
 # Fetch accession sequences for species
-scrape_species_accessions <- function(species_row, locus, output_folder, max_seqs = 100) {
+fetch_species_accessions <- function(species_row, locus, output_folder, max_seqs = 50) {
   
-  species_name <- species_row$search_name
+  species_name <- species_row$species
   n_target <- species_row$n_target
   ids_target <- species_row$ids_target
   
@@ -300,81 +456,85 @@ scrape_species_accessions <- function(species_row, locus, output_folder, max_seq
   return(result_df)
 }
 
-# Main processing function: Process all clades
+# Maine process missing clades function
 process_missing_clades <- function(clades_missing, 
-                                   target_locus_searchterm, 
-                                   rank_column = clade_level,  # Can be "order", "family", "class", etc.
-                                   max_species_per_clade = max_species_per_clade) {
+                                   locus_searchterm,
+                                   rank_column = "order",
+                                   max_species_per_clade = 3) {
   
   setDT(clades_missing)
   
   cat("Processing", nrow(clades_missing), "missing clades at rank:", rank_column, "\n")
   
-  # Initialize results
   all_results <- list()
   
   for (i in 1:nrow(clades_missing)) {
-    cat("\rProcessing clade", i, "of", nrow(clades_missing))
+    cat("\nProcessing clade", i, "of", nrow(clades_missing), ":")
     
-    # Get the current clade row (THIS IS THE KEY CHANGE)
     clade_row <- clades_missing[i, ]
     
-    # Extract clade ID from the rank column (format: "Name_ID")
-    clade_info <- clade_row[[rank_column]]  # Changed from get() to [[]]
-    clade_id <- strsplit(clade_info, "_")[[1]][2]
+    # Extract clade ID
+    clade_info <- clade_row[[rank_column]]
+    clade_parts <- strsplit(clade_info, "_")[[1]]
+    clade_id <- clade_parts[length(clade_parts)]
+    clade_name <- paste(clade_parts[-length(clade_parts)], collapse = "_")
     
-    if (is.na(clade_id)) {
-      warning(paste("No clade ID found for row", i))
+    cat(" ", clade_name, "(", clade_id, ")")
+    
+    if (is.na(clade_id) || clade_id == "") {
+      cat(" - No clade ID\n")
       next
     }
     
-    # Get species list for this clade
+    # Get species list
     species_ids <- get_clade_species(clade_id, max_species = 1000)
     
     if (is.null(species_ids) || length(species_ids) == 0) {
-      warning(paste("No species found for clade", clade_id))
+      cat(" - No species found\n")
       next
     }
     
     Sys.sleep(0.35)
     
-    # Randomize species order
+    # Randomize and search
     species_ids <- sample(species_ids)
-    
-    # Search for sequences until we find max_species_per_clade or run out
     finds <- 0
-    max_to_search <- min(length(species_ids), max_species_per_clade * 10)  # Search up to 10x the target
+    max_to_search <- min(length(species_ids), max_species_per_clade * 10)
+    
+    cat("\n  Searching up to", max_to_search, "species...")
     
     for (j in 1:max_to_search) {
       if (finds >= max_species_per_clade) break
       
-      result <- search_species_sequences(species_ids[j], target_locus_searchterm)
+      result <- search_species_sequences(species_ids[j], locus_searchterm)
       
       if (result$found) {
-        # Get taxonomy info for this species
+        cat("\n  Found sequences for species", species_ids[j])
+        
+        # Get taxonomy
         tax_info <- extract_taxonomy(species_ids[j])
         
         Sys.sleep(0.35)
         
-        # Create result row (USING clade_row INSTEAD OF clades_missing[i, column])
+        # Create result row
         result_row <- data.table(
           superkingdom = clade_row$superkingdom,
           kingdom = clade_row$kingdom,
           phylum = clade_row$phylum,
           class = clade_row$class,
           order = clade_row$order,
-          family = ifelse(!is.na(tax_info$family), 
-                          paste0(tax_info$family, "_", species_ids[j]), 
-                          NA),
-          genus = ifelse(!is.na(tax_info$genus), 
-                         paste0(tax_info$genus, "_", species_ids[j]), 
-                         NA),
-          species = ifelse(!is.na(tax_info$species), 
-                           paste0(tax_info$species, "_", species_ids[j]), 
-                           NA),
-          species_id = species_ids[j],
-          ids_mitogenome = ifelse(!is.na(result$mito_id), result$mito_id, NA),
-          ids_target = ifelse(!is.na(result$target_id), result$target_id, NA),
+          family = ifelse(!is.na(tax_info$family) && !is.na(tax_info$family_id),
+                          paste0(tax_info$family, "_", tax_info$family_id),
+                          NA_character_),
+          genus = ifelse(!is.na(tax_info$genus) && !is.na(tax_info$genus_id),
+                         paste0(tax_info$genus, "_", tax_info$genus_id),
+                         NA_character_),
+          species = ifelse(!is.na(tax_info$species),
+                           paste0(tax_info$species, "_", species_ids[j]),
+                           NA_character_),
+          species_id = as.character(species_ids[j]),
+          ids_mitogenome = ifelse(!is.na(result$mito_id), as.character(result$mito_id), NA_character_),
+          ids_target = ifelse(!is.na(result$target_id), as.character(result$target_id), NA_character_),
           n_mitogenome = "clade representative",
           n_target = "clade representative",
           tax_query = paste0("txid", species_ids[j])
@@ -384,20 +544,21 @@ process_missing_clades <- function(clades_missing,
         finds <- finds + 1
       }
     }
+    
+    cat("\n  Total found for", clade_name, ":", finds, "\n")
   }
   
-  cat("\n")
+  cat("\n\nComplete!\n")
   
-  # Combine all results
   if (length(all_results) == 0) {
     warning("No sequences found for any clades")
     return(NULL)
   }
   
   clade_seqs <- rbindlist(all_results, fill = TRUE)
-  
   return(clade_seqs)
 }
+
 
 ############# MITOGENOME SCRAPING FUNCTIONS #######################
 # Fetch GenBank record and extract sequence for a specific feature
@@ -549,33 +710,32 @@ extract_gene_name <- function(feature_block, target_synonyms) {
   gene_value <- regmatches(gene_line[1], gene_match)
   gene_value <- gsub('"', '', gene_value)
   
-  # Check if it matches any synonym
-  matches <- sapply(target_synonyms, function(syn) {
-    grepl(syn, gene_value, ignore.case = TRUE)
-  })
-  
-  if (any(matches)) {
-    return(gene_value)
+  # Check if it matches any synonym (ONE AT A TIME)
+  for (syn in target_synonyms) {
+    if (grepl(syn, gene_value, ignore.case = TRUE)) {
+      return(gene_value)
+    }
   }
   
   return(NA)
 }
 
-# Main processing function - base R approach
+# Function to process species mitogenomes
 process_species_mitogenomes <- function(species_row, target_synonyms, is_gene = TRUE, max_mitos = 20) {
   
-  species_name <- species_row$search_name
-  n_mitogenomes <- species_row$n_mitogenome
+  species_name <- species_row$species
+  n_mitogenomes <- as.numeric(species_row$n_mitogenome)
+  ids_mitogenome <- species_row$ids_mitogenome
   
   cat("\rProcessing:", species_name, "with", n_mitogenomes, "mitogenomes")
   
   # Skip if no mitogenomes
-  if (n_mitogenomes == 0) {
+  if (is.na(n_mitogenomes) || n_mitogenomes == 0 || is.na(ids_mitogenome)) {
     return(NULL)
   }
   
   # Parse mitogenome IDs
-  mito_ids <- unlist(strsplit(species_row$ids_mitogenome, split = "\\|"))
+  mito_ids <- unlist(strsplit(ids_mitogenome, split = "\\|"))
   
   # Subsample if > max_mitos
   if (length(mito_ids) > max_mitos) {
@@ -591,7 +751,7 @@ process_species_mitogenomes <- function(species_row, target_synonyms, is_gene = 
     return(NULL)
   })
   
-  if (is.null(mito_accessions)) {
+  if (is.null(mito_accessions) || length(mito_accessions) == 0) {
     return(NULL)
   }
   
@@ -603,14 +763,24 @@ process_species_mitogenomes <- function(species_row, target_synonyms, is_gene = 
     
     extracted <- extract_mito_feature(mito_accessions[i], target_synonyms, is_gene)
     
-    results_list[[i]] <- data.frame(
-      header = extracted$header,
-      sequence = extracted$sequence,
-      accession = extracted$accession,
-      source = extracted$status,
-      species = species_name,
-      stringsAsFactors = FALSE
-    )
+    # Only create data frame if sequence was found
+    if (!is.na(extracted$sequence)) {
+      results_list[[i]] <- data.frame(
+        seq_header = extracted$header,
+        sequence = extracted$sequence,
+        seq_accession = extracted$accession,
+        type = extracted$status,
+        species = species_name,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  
+  # Remove NULL entries
+  results_list <- results_list[!sapply(results_list, is.null)]
+  
+  if (length(results_list) == 0) {
+    return(NULL)
   }
   
   # Combine results
