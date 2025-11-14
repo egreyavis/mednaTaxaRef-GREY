@@ -31,6 +31,7 @@ max_species_per_clade = 3 # how many representative species per missing clade? m
 
 ### LOAD PACKAGES ETC.
 ```{r loadPackagesAndTerms}
+source("functions.R") #use these in-house functions in this R script
 library(rentrez) #queries ENTREZ databases and downloads accessions
 library(AnnotationBustR) #list of locus synonyms
 library(reutils) #other packages need it
@@ -42,8 +43,6 @@ library(Biostrings) #sequence manipulations
 set_entrez_key(entrez_key) #set the Entrez API key
 
 dir.create(output_folder) #create the output folder
-
-source("functions.R") #use the functions in this R script
 
 # Get the locus search term
 data(mtDNAterms) #AnnotationBustR's list of synonyms for different loci
@@ -139,24 +138,41 @@ cat("Complete! Saved results to tax_accessions.csv\n")
 
 ### GET ACCESSIONS
 ```{r fetch_accessions}
-cat("Fetching accessions for", nrow(tax_df), "species\n")
+cat("Fetch accessions for", nrow(tax_df), "species\n")
 
-REFDB_accessions <- rbindlist(lapply(1:nrow(tax_df), function(i) {
+results_list <- lapply(1:nrow(tax_df), function(i) {
   cat("\rFetching accessions for species", i, "of", nrow(tax_df))
   
-  result <- fetch_species_accessions(
-    species_row = as.list(tax_df[i, ]),
-    locus = locus,
-    output_folder = output_folder,
-    max_seqs = 100
-  )
+  result <- tryCatch({
+    fetch_species_accessions(
+      species_row = tax_df[i, ],
+      locus = locus,
+      output_folder = output_folder,
+      max_seqs = 100
+    )
+  }, error = function(e) {
+    warning(paste("Error processing species", i, ":", e$message))
+    return(NULL)
+  })
   
   Sys.sleep(1)
   
   return(result)
-}), fill = TRUE)
+})
 
-cat("\nComplete! Scraped", nrow(REFDB_accessions), "sequences\n")
+cat("\n")
+
+# Combine all results, removing NULLs
+results_list <- results_list[!sapply(results_list, is.null)]
+
+if (length(results_list) == 0) {
+  warning("No sequences fetched for any species")
+  REFDB <- data.frame()
+} else {
+  REFDB <- do.call(rbind, results_list)
+  row.names(REFDB) <- NULL
+  cat("Complete! Fetched", nrow(REFDB), "sequences\n")
+}
 
 ```
 
@@ -293,7 +309,7 @@ REFDB_unique_dada[, header := paste0(
 )]
 
 REFDB_unique_dada <- REFDB_unique_dada[,c("header","sequence")]
-write.table(REFDB_unique_dada, file.path(output_folder, paste0("REFDB_unique_dada_", locus, "_", Sys.Date(),".fasta"), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
+write.table(REFDB_unique_dada, file.path(output_folder, paste0("REFDB_unique_dada_", locus, "_", Sys.Date(),".fasta")), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
 
 cat("Saved dada reference library with", nrow(REFDB_unique_dada), "sequences across", length(unique(REFDB_unique_dada$header)), "species\n")
 ```
