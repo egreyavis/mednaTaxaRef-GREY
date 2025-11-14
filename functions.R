@@ -87,8 +87,7 @@ backfill_missing_ranks <- function(taxonomy_df) {
   return(taxonomy_df)
 }
 
-
-########### ACCESSION FINDING AND DOWNLOADING FUNCTIONS #######################
+########### ACCESSION FINDING AND FETCHING FUNCTIONS #######################
 # Function to search Genbank for accessions by species and locus
 search_species_accessions <- function(species_row, locus_searchterm, delay = 0.35) {
   
@@ -156,7 +155,124 @@ search_species_accessions <- function(species_row, locus_searchterm, delay = 0.3
   return(result)
 }
 
-########### PROCESS MISSING CLADES ####################
+# Function to fetch species accessions with failure tracking
+fetch_species_accessions <- function(species_row, locus, output_folder, max_seqs = 100, max_retries = 2) {
+  
+  species_name <- species_row$species
+  n_target <- species_row$n_target
+  ids_target <- species_row$ids_target
+  
+  # Skip if no targets
+  if (is.na(n_target) || n_target == 0 || is.na(ids_target)) {
+    return(list(data = NULL, status = "no_targets"))
+  }
+  
+  # Parse IDs
+  ids <- unlist(strsplit(ids_target, split = "\\|"))
+  
+  # Subsample if > max_seqs
+  if (length(ids) > max_seqs) {
+    ids <- sample(ids, max_seqs)
+  }
+  
+  # Fetch sequences with retry logic
+  seqs_target <- NULL
+  for (attempt in 1:max_retries) {
+    seqs_target <- tryCatch({
+      entrez_fetch(db = "nuccore", id = ids, rettype = "fasta")
+    }, error = function(e) {
+      if (attempt < max_retries) {
+        message(paste("Attempt", attempt, "failed for", species_name, "- retrying..."))
+        Sys.sleep(2)  # Wait before retry
+      }
+      return(NULL)
+    })
+    
+    if (!is.null(seqs_target)) break
+  }
+  
+  if (is.null(seqs_target)) {
+    return(list(data = NULL, status = "fetch_failed", species = species_name))
+  }
+  
+  # Write and read back sequences
+  fasta_file <- file.path(output_folder, paste(species_name, paste0(locus, ".fasta")))
+  
+  tryCatch({
+    write(seqs_target, fasta_file)
+  }, error = function(e) {
+    return(list(data = NULL, status = "write_failed", species = species_name))
+  })
+  
+  fasta_target <- tryCatch({
+    readDNAStringSet(fasta_file, format = "fasta")
+  }, error = function(e) {
+    return(list(data = NULL, status = "read_failed", species = species_name))
+  })
+  
+  if (is.null(fasta_target) || length(fasta_target) == 0) {
+    return(list(data = NULL, status = "empty_fasta", species = species_name))
+  }
+  
+  # Fetch accession numbers with retry
+  seqs_target_accessions <- NULL
+  for (attempt in 1:max_retries) {
+    seqs_target_accessions <- tryCatch({
+      entrez_fetch(db = "nuccore", id = ids, rettype = "acc")
+    }, error = function(e) {
+      if (attempt < max_retries) {
+        message(paste("Attempt", attempt, "failed fetching accessions for", species_name, "- retrying..."))
+        Sys.sleep(2)
+      }
+      return(NULL)
+    })
+    
+    if (!is.null(seqs_target_accessions)) break
+  }
+  
+  if (is.null(seqs_target_accessions)) {
+    return(list(data = NULL, status = "accession_fetch_failed", species = species_name))
+  }
+  
+  # Parse results
+  seq_header <- names(fasta_target)
+  sequence <- as.character(fasta_target)
+  seq_accession <- unlist(strsplit(seqs_target_accessions, split = "\n"))
+  
+  # Check that lengths match
+  n_seqs <- length(seq_header)
+  n_accs <- length(seq_accession)
+  
+  if (n_seqs != n_accs) {
+    warning(paste(
+      "Mismatch for", species_name, "- Sequences:", n_seqs, "Accessions:", n_accs
+    ))
+    
+    min_len <- min(n_seqs, n_accs)
+    
+    if (min_len == 0) {
+      return(list(data = NULL, status = "length_mismatch", species = species_name))
+    }
+    
+    seq_header <- seq_header[1:min_len]
+    sequence <- sequence[1:min_len]
+    seq_accession <- seq_accession[1:min_len]
+  }
+  
+  # Create data frame
+  result_df <- data.frame(
+    seq_header = seq_header,
+    sequence = sequence,
+    seq_accession = seq_accession,
+    type = rep("accession", length(seq_header)),
+    species = rep(species_name, length(seq_header)),
+    stringsAsFactors = FALSE
+  )
+  
+  return(list(data = result_df, status = "success", species = species_name))
+}
+
+########### ADD MISSING CLADE MITOGENOMES AND ACCESSIONS (optional) ###########
 # Function to get species list for a clade using NCBI Taxonomy
 get_clade_species <- function(clade_id, max_species = 1000) {
   
@@ -377,83 +493,6 @@ get_taxonomy_info <- function(species_ids) {
   })
   
   return(tax_list)
-}
-
-# Fetch accession sequences for species
-fetch_species_accessions <- function(species_row, locus, output_folder, max_seqs = 50) {
-  
-  species_name <- species_row$species
-  n_target <- species_row$n_target
-  ids_target <- species_row$ids_target
-  
-  # Skip if no targets
-  if (n_target == 0 || is.na(ids_target)) {
-    return(NULL)
-  }
-  
-  # Parse IDs
-  ids <- unlist(strsplit(ids_target, split = "\\|"))
-  
-  # Subsample if > max_seqs
-  if (length(ids) > max_seqs) {
-    ids <- sample(ids, max_seqs)
-  }
-  
-  # Fetch sequences from GenBank
-  seqs_target <- tryCatch({
-    entrez_fetch(db = "nuccore", id = ids, rettype = "fasta")
-  }, error = function(e) {
-    warning(paste("Failed to fetch sequences for", species_name, ":", e$message))
-    return(NULL)
-  })
-  
-  if (is.null(seqs_target)) {
-    return(NULL)
-  }
-  
-  # Write and read back sequences
-  fasta_file <- file.path(output_folder, paste(species_name, paste0(locus, ".fasta")))
-  write(seqs_target, fasta_file)
-  
-  fasta_target <- tryCatch({
-    readDNAStringSet(fasta_file, format = "fasta")
-  }, error = function(e) {
-    warning(paste("Failed to read fasta for", species_name))
-    return(NULL)
-  })
-  
-  if (is.null(fasta_target) || length(fasta_target) == 0) {
-    return(NULL)
-  }
-  
-  # Fetch accession numbers
-  seqs_target_accessions <- tryCatch({
-    entrez_fetch(db = "nuccore", id = ids, rettype = "acc")
-  }, error = function(e) {
-    warning(paste("Failed to fetch accessions for", species_name))
-    return(NULL)
-  })
-  
-  if (is.null(seqs_target_accessions)) {
-    return(NULL)
-  }
-  
-  # Parse and format results
-  seq_header <- names(fasta_target)
-  sequence <- as.character(fasta_target)
-  seq_accession <- unlist(strsplit(seqs_target_accessions, split = "\n"))
-  
-  # Create data frame
-  result_df <- data.frame(
-    seq_header = seq_header,
-    sequence = sequence,
-    seq_accession = seq_accession,
-    type = "accession",
-    species = species_name,
-    stringsAsFactors = FALSE
-  )
-  
-  return(result_df)
 }
 
 # Maine process missing clades function
