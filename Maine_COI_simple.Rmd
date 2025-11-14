@@ -17,26 +17,38 @@ rm(list=ls())
 ## species_list must have "search_name" column that has species binomials
 
 ```{r define_variables}
+######### CHECK/UPDATE ALL OF THESE EACH TImE
 entrez_key <- "7c5ac035201a1835b5a81de1b74ec8613d08" #GET YOUR OWN ENTREZ KEY AND PUT IT HERE!
 locus = "COI" #name of target locus, see choices above 
-output_folder <- "Maine_COI_2025-11-08" #name of your output folder every time
-species_list <- read.csv("workingfiles/GNRMaineSpecies_May2024.csv") # your species list, must have column named "species" with binomial
-clade_list <- read.csv("workingfiles/EukaryoteFamilies_NCBI_2023-09-19.csv") # list of eukaryote families in NCBI, change if necessary
-clade_level <- "order" # what taxonomic level do you want representatives for, 
-max_species_per_clade = 3 # how many representative species per missing clade? must be numeric
+species_list_name <- "GNRMaineSpecies_May2024" # name of the species list without the .csv; must be .csv and have column named "species" with binomial
+output_folder <- paste(species_list_name, locus, Sys.Date(), sep="-") #name of your output folder every time
+species_list <- read.csv(paste("workingfiles/", species_list_name, ".csv", sep=""), header=TRUE) # read in the species list
+include_missing_clades <- "yes" # put yes if you want to do this, anything else will be no. If yes, fill out the variables below.
+format <- "dada" # dada for the dada2 assignTaxonomy format, anything else will not format past REFDB_uniques
+subset_for_testing <- "yes" # put yes if you want to do this, onything else will be no. If yes, fill out the variables below.
 
-#species_list <- species_list[c(205:215, 12796, 639, 8902,9775),] ## SUBSET FOR TESTING
-#clade_list <- clade_list[sample(nrow(clade_list), 10, replace=FALSE),] ## SUBSET FOR TESTING
+### INCLUDE MISSING CLADE SEQUENCES?
+if (include_missing_clades == "yes") {
+  clade_list <- read.csv("workingfiles/EukaryoteFamilies_NCBI_2023-09-19.csv") # list of eukaryote families in NCBI, change if necessary
+  clade_level <- "order" # what taxonomic level do you want representatives for, 
+  max_species_per_clade = 3 # how many representative species per missing clade? must be numeric
+}
+
+### SUBSET FOR TESTING?
+if (subset_for_testing == "yes") {
+  species_list <- species_list[sample(nrow(species_list), 10, replace=FALSE),] ## SUBSET FOR TESTING
+  clade_list <- clade_list[sample(nrow(clade_list), 10, replace=FALSE),] ## SUBSET FOR TESTING
+}
 ```
 
-### LOAD PACKAGES ETC.
+### LOAD PACKAGES, FUNCTIONS, KEYS, OUTPUT FOLDER, LOCUS TERMS, FORMAT SPECIES LIST
 ```{r loadPackagesAndTerms}
 source("functions.R") #use these in-house functions in this R script
+
 library(rentrez) #queries ENTREZ databases and downloads accessions
 library(AnnotationBustR) #list of locus synonyms
 library(reutils) #other packages need it
 library(ape) #convert fasta, fastq, etc.
-library(ggplot2) #plots
 library(data.table) #faster processing
 library(Biostrings) #sequence manipulations
 
@@ -55,7 +67,7 @@ locus_synonyms$Terms[dim(locus_synonyms)[1]] <- paste0("OR ", locus_synonyms$Nam
 locus_searchterm <- paste(as.vector(locus_synonyms$Terms), collapse=" ") # the big ENTREZ locus search term
 print(locus_searchterm)
 
-# Add the taxonomy ids to the names
+# Read in the species list and create a taxonomy dataframe
 tax_df <- add_taxids_to_taxonomy(species_list)
 tax_df <- tax_df[,c("superkingdom", "kingdom", "phylum", "class", "order", "family", "genus", "species")]
 tax_df <- tax_df[tax_df$species != "na",] # remove any taxa without species names
@@ -63,30 +75,26 @@ tax_df <- backfill_missing_ranks(tax_df)
 head(tax_df) # check format
 ```
 
-### IDENTFY MISSING CLADES
-```{r getTaxonomiesAndMissingClades}
-
-clades_tax_df <- unique(tax_df[[clade_level]]) 
-setDT(clade_list)
-clade_uniques <- clade_list[!duplicated(clade_list[, ..clade_level]),] # deduplicate the clade of interest in the list
-clades_missing <- clade_uniques[!(get(clade_level) %in% clades_tax_df), .(superkingdom, kingdom, phylum, class, order)] #clades not represented in the tax_df
-clades_missing$spp_list <- NA
-
-```
-
-### GET SPECIES REPRESENTATIVES FOR MISSNG CLADES
-```{r getMissingCladeSpecies_optional}
-
-clade_seqs <- process_missing_clades(
-  clades_missing = clades_missing,
-  locus_searchterm = locus_searchterm,
-  rank_column = clade_level,
-  max_species_per_clade = max_species_per_clade
+### GET SPECIES REPRESENTATIVES FOR MISSNG CLADES (optional)
+```{r getMissingClades_optional}
+if (include_missing_clades == "yes") {
+  # Identify Clades not represented in the species list
+  clades_tax_df <- unique(tax_df[[clade_level]]) 
+  setDT(clade_list)
+  clade_uniques <- clade_list[!duplicated(clade_list[, ..clade_level]),] # deduplicate the clade of interest in the list
+  clades_missing <- clade_uniques[!(get(clade_level) %in% clades_tax_df), .(superkingdom, kingdom, phylum, class, order)] 
+  # Find species and locus accessions for missing clades
+  clades_missing$spp_list <- NA
+  clade_seqs <- process_missing_clades(
+    clades_missing = clades_missing,
+    locus_searchterm = locus_searchterm,
+    rank_column = clade_level,
+    max_species_per_clade = max_species_per_clade
   )
-
+}
 ```
 
-### SEARCH ENTREZ FOR ACCESSIONS BY SPECIES AND LOCUS
+### SEARCH ENTREZ FOR ACCESSIONS BY LOCUS AND SPECIES LIST
 ```{r search_species_accessions}
 setDT(tax_df) # Convert to data.table for faster processing
 
@@ -125,9 +133,16 @@ tax_df$ids_target <- results_df$ids_target
 # Now combine with clade_seqs
 setDT(tax_df)
 setDT(clade_seqs)
+clade_seqs$clade_representative = "yes"
+tax_df$clade_representative = "no"
+tax_df[, n_mitogenome := as.numeric(n_mitogenome)]
+tax_df[, n_target := as.numeric(n_target)]
 
 # Make sure both have the same columns
 tax_df <- rbind(tax_df, clade_seqs, fill = TRUE)
+setDT(tax_df) # Convert to data.table for faster operations
+tax_df[, n_mitogenome := as.numeric(n_mitogenome)] # format
+tax_df[, n_target := as.numeric(n_target)] #format
 
 # Save results
 fwrite(tax_df, file.path(output_folder, paste0("tax_accessions_", locus, "_", Sys.Date(),".csv")))
@@ -138,9 +153,17 @@ cat("Complete! Saved results to tax_accessions.csv\n")
 
 ### GET ACCESSIONS
 ```{r fetch_accessions}
-cat("Fetch accessions for", nrow(tax_df), "species\n")
+cat("Fetching accessions for", nrow(tax_df), "species\n")
 
-results_list <- lapply(1:nrow(tax_df), function(i) {
+results_list <- vector("list", nrow(tax_df))
+failed_species <- data.frame(
+  species = character(),
+  status = character(),
+  row_number = integer(),
+  stringsAsFactors = FALSE
+)
+
+for (i in 1:nrow(tax_df)) {
   cat("\rFetching accessions for species", i, "of", nrow(tax_df))
   
   result <- tryCatch({
@@ -151,29 +174,54 @@ results_list <- lapply(1:nrow(tax_df), function(i) {
       max_seqs = 100
     )
   }, error = function(e) {
-    warning(paste("Error processing species", i, ":", e$message))
-    return(NULL)
+    warning(paste("\nError processing species", i, ":", e$message))
+    species_name <- if (!is.null(tax_df[i, ]$species)) tax_df[i, ]$species else "unknown"
+    return(list(data = NULL, status = "error", species = species_name))
   })
   
-  Sys.sleep(1)
+  # Track failures
+  if (!is.null(result$status) && result$status != "success") {
+    failed_species <- rbind(failed_species, data.frame(
+      species = ifelse(is.null(result$species), "unknown", result$species),
+      status = result$status,
+      row_number = i,
+      stringsAsFactors = FALSE
+    ))
+  }
   
-  return(result)
-})
+  # Extract just the data frame part
+  results_list[[i]] <- result$data
+  
+  Sys.sleep(1)
+}
 
 cat("\n")
 
-# Combine all results, removing NULLs
+# Combine results - now just data frames
 results_list <- results_list[!sapply(results_list, is.null)]
 
 if (length(results_list) == 0) {
   warning("No sequences fetched for any species")
-  REFDB <- data.frame()
+  REFDB_accessions <- data.frame()
 } else {
-  REFDB <- do.call(rbind, results_list)
-  row.names(REFDB) <- NULL
-  cat("Complete! Fetched", nrow(REFDB), "sequences\n")
+  REFDB_accessions <- do.call(rbind, results_list)
+  row.names(REFDB_accessions) <- NULL
+  cat("Complete! Fetched", nrow(REFDB_accessions), "sequences\n")
 }
 
+# Report failures
+if (nrow(failed_species) > 0) {
+  cat("\n", nrow(failed_species), "species failed:\n")
+  print(failed_species)
+  
+  # Save failed species list
+  write.csv(failed_species, file.path(output_folder, "failed_species.csv"), row.names = FALSE)
+  cat("\nFailed species list saved to:", file.path(output_folder, "failed_species.csv"), "\n")
+  
+  # Summary by failure type
+  cat("\nFailure reasons:\n")
+  print(table(failed_species$status))
+}
 ```
 
 ### GET TARGET LOCI FROM MITOGENOMES
@@ -226,7 +274,7 @@ cat("Saved", nrow(REFDB_unique), "unique sequences\n")
 ```
 
 ## Summarize ref sequence results for species in the original list
-```{r summarize_species}
+```{r summarize_species_list}
 
 setDT(species_list)
 setDT(REFDB_unique)
@@ -289,27 +337,28 @@ cat("Species with Accessions & Mitogenomes:", n_species_bothAccessionsAndMitogen
 
 ## Format REFDB for dada2 assignTaxonomy()
 ```{r format_dada2_optional}
+if (format == "dada") {
+  REFDB_unique_dada <- merge(x=REFDB_unique, y=tax_df, by="species", all=TRUE) 
+  REFDB_unique_dada <- REFDB_unique_dada[!is.na(REFDB_unique_dada$sequence),]
 
-REFDB_unique_dada <- merge(x=REFDB_unique, y=tax_df, by="species", all=TRUE) 
-REFDB_unique_dada <- REFDB_unique_dada[!is.na(REFDB_unique_dada$sequence),]
+  # Create header column with ">" at the beginning
+  REFDB_unique_dada[, header := paste0(
+    ">",
+    paste(
+      ifelse(is.na(kingdom.x), "", kingdom.x),
+      ifelse(is.na(phylum.x), "", phylum.x),
+      ifelse(is.na(class.x), "", class.x),
+      ifelse(is.na(order.x), "", order.x),
+      ifelse(is.na(family.x), "", family.x),
+      ifelse(is.na(genus.x), "", genus.x),
+      ifelse(is.na(species), "", species),
+      sep = ";"
+    )
+  )]
 
-# Create header column with ">" at the beginning
-REFDB_unique_dada[, header := paste0(
-  ">",
-  paste(
-    ifelse(is.na(kingdom.x), "", kingdom.x),
-    ifelse(is.na(phylum.x), "", phylum.x),
-    ifelse(is.na(class.x), "", class.x),
-    ifelse(is.na(order.x), "", order.x),
-    ifelse(is.na(family.x), "", family.x),
-    ifelse(is.na(genus.x), "", genus.x),
-    ifelse(is.na(species), "", species),
-    sep = ";"
-  )
-)]
+  REFDB_unique_dada <- REFDB_unique_dada[,c("header","sequence")]
+  write.table(REFDB_unique_dada, file.path(output_folder, paste0("REFDB_unique_dada_", locus, "_", Sys.Date(),".fasta")), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
 
-REFDB_unique_dada <- REFDB_unique_dada[,c("header","sequence")]
-write.table(REFDB_unique_dada, file.path(output_folder, paste0("REFDB_unique_dada_", locus, "_", Sys.Date(),".fasta")), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
-
-cat("Saved dada reference library with", nrow(REFDB_unique_dada), "sequences across", length(unique(REFDB_unique_dada$header)), "species\n")
+  cat("Saved dada reference library with", nrow(REFDB_unique_dada), "sequences across", length(unique(REFDB_unique_dada$header)), "species\n")
+}
 ```

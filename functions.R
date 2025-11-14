@@ -298,7 +298,7 @@ get_clade_species <- function(clade_id, max_species = 1000) {
   })
 }
 
-# Improved function to extract taxonomy with better XML parsing
+# Improved function to extract taxonomy for clade species with better XML parsing
 extract_taxonomy <- function(species_id) {
   
   # Fetch full classification using efetch
@@ -555,7 +555,7 @@ process_missing_clades <- function(clades_missing,
         
         Sys.sleep(0.35)
         
-        # Create result row
+        # Create result row with n_mitogenome and n_target as numeric
         result_row <- data.table(
           superkingdom = clade_row$superkingdom,
           kingdom = clade_row$kingdom,
@@ -571,11 +571,11 @@ process_missing_clades <- function(clades_missing,
           species = ifelse(!is.na(tax_info$species),
                            paste0(tax_info$species, "_", species_ids[j]),
                            NA_character_),
-          species_id = as.character(species_ids[j]),
+          n_mitogenome = ifelse(!is.na(result$mito_id), 1, 0),  # Numeric: 1 if found, 0 if not
           ids_mitogenome = ifelse(!is.na(result$mito_id), as.character(result$mito_id), NA_character_),
+          n_target = ifelse(!is.na(result$target_id), 1, 0),  # Numeric: 1 if found, 0 if not
           ids_target = ifelse(!is.na(result$target_id), as.character(result$target_id), NA_character_),
-          n_mitogenome = "clade representative",
-          n_target = "clade representative",
+          species_id = as.character(species_ids[j]),
           tax_query = paste0("txid", species_ids[j])
         )
         
@@ -762,14 +762,15 @@ extract_gene_name <- function(feature_block, target_synonyms) {
 # Function to process species mitogenomes
 process_species_mitogenomes <- function(species_row, target_synonyms, is_gene = TRUE, max_mitos = 20) {
   
-  species_name <- species_row$species
-  n_mitogenomes <- as.numeric(species_row$n_mitogenome)
-  ids_mitogenome <- species_row$ids_mitogenome
+  # Extract values and convert to proper types
+  species_name <- as.character(species_row$species)
+  n_mitogenomes <- as.numeric(species_row$n_mitogenome)  # Convert character to numeric
+  ids_mitogenome <- as.character(species_row$ids_mitogenome)
   
   cat("\rProcessing:", species_name, "with", n_mitogenomes, "mitogenomes")
   
-  # Skip if no mitogenomes
-  if (is.na(n_mitogenomes) || n_mitogenomes == 0 || is.na(ids_mitogenome)) {
+  # Skip if no mitogenomes - now checks numeric properly
+  if (is.na(n_mitogenomes) || n_mitogenomes == 0 || is.na(ids_mitogenome) || ids_mitogenome == "") {
     return(NULL)
   }
   
