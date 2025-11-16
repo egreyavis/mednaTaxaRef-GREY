@@ -1,0 +1,611 @@
+---
+title: "REFDB_processing"
+author: "Erin Grey"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+```
+
+### DEFINE THE FOLLOWING VARIABLES FOR YOUR ANALYSIS
+```{r define_variables}
+
+entrez_key <- "7c5ac035201a1835b5a81de1b74ec8613d08" # GET YOUR OWN ENTREZ KEY
+locus = "COI" # name of target locus
+species_list_name <- "GNRMaineSpecies_May2024" # name of the species list without .csv
+output_folder <- paste(species_list_name, locus, Sys.Date(), sep="-") # output folder name
+species_list_file <- paste0("workingfiles/", species_list_name, ".csv")
+include_missing_clades <- "yes" # "yes" to include clade representatives
+format <- "dada" # "dada" for dada2 format, anything else skips
+subset_for_testing <- "yes" # "yes" to subset for testing
+min_length <- 100 # minimum sequence length (bp), non-numeric to skip
+max_length <- 4000 # maximum sequence length (bp), non-numeric to skip
+
+# INCLUDE MISSING CLADE SEQUENCES?
+if (include_missing_clades == "yes") {
+clade_list_file <- "workingfiles/EukaryoteFamilies_NCBI_2023-09-19.csv"
+clade_level <- "order" # taxonomic level for representatives
+max_species_per_clade <- 3 # number of representative species per clade
+}
+
+# INCLUDE MISSING CLADE SEQUENCES?
+if (subset_for_testing == "yes") {
+  n_species <- 10
+  n_clades <- 10
+}
+
+```
+
+```{r loadPackagesAndTerms}
+
+# Load functions first
+source("functions.R")
+
+# Load required packages
+library(rentrez)
+library(AnnotationBustR)
+library(data.table)
+library(Biostrings)
+
+cat("\n==================================================\n")
+cat("  MITOCHONDRIAL REFERENCE DATABASE BUILDER\n")
+cat("==================================================\n\n")
+
+# Set Entrez key
+set_entrez_key(entrez_key)
+validate_entrez_key()
+
+# Create output folder
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder, recursive = TRUE)
+  cat("✓ Created output folder:", output_folder, "\n")
+} else {
+  cat("✓ Output folder exists:", output_folder, "\n")
+}
+
+# Initialize error log
+log_file <- init_error_log(output_folder)
+cat("✓ Error log initialized:", log_file, "\n\n")
+
+# Validate species list file exists
+if (!file.exists(species_list_file)) {
+  stop("Species list file not found: ", species_list_file)
+}
+cat("✓ Species list file found\n")
+
+# Read species list
+species_list <- tryCatch({
+  read.csv(species_list_file, header = TRUE)
+}, error = function(e) {
+  stop("Failed to read species list: ", e$message)
+})
+
+# Validate species list structure
+validate_species_list(species_list)
+
+# Get locus information
+data(mtDNAterms)
+mtDNAterms <- rbind(mtDNAterms, 
+                    data.frame(Locus = "rRNA_12S", 
+                              Type = "rRNA", 
+                              Name = "small ribosomal RNA subunit RNA"))
+
+validate_locus(locus, mtDNAterms)
+
+is_mtgene <- locus %in% c("ATP6", "ATP8", "COI", "COII", "COIII", "CYTB", 
+                         "ND1", "ND2", "ND3", "ND4", "ND4L", "ND5", "ND6")
+
+locus_synonyms <- mtDNAterms[mtDNAterms$Locus == locus, ]
+locus_synonyms$Terms <- paste0("OR ", locus_synonyms$Name, "[TITL]")
+locus_synonyms$Terms[1] <- paste0("AND (", locus_synonyms$Name[1], "[TITL]")
+locus_synonyms$Terms[nrow(locus_synonyms)] <- paste0("OR ", 
+                                                     locus_synonyms$Name[nrow(locus_synonyms)], 
+                                                     "[TITL])")
+locus_searchterm <- paste(as.vector(locus_synonyms$Terms), collapse = " ")
+
+cat("\n✓ Locus search term created\n")
+cat("  Searching for:", locus, "\n")
+cat("  Is gene:", is_mtgene, "\n")
+cat("  Synonyms:", nrow(locus_synonyms), "\n\n")
+
+# Process taxonomy
+cat("--------------------------------------------------\n")
+cat("PROCESSING TAXONOMY\n")
+cat("--------------------------------------------------\n")
+
+tax_df <- add_taxids_to_taxonomy(species_list)
+tax_df <- tax_df[, c("superkingdom", "kingdom", "phylum", "class", "order", 
+                     "family", "genus", "species")]
+tax_df <- tax_df[tax_df$species != "na", ]
+tax_df <- backfill_missing_ranks(tax_df)
+
+cat("✓ Final taxonomy table:", nrow(tax_df), "species\n\n")
+
+### SUBSET FOR TESTING?
+if (subset_for_testing == "yes") {
+  original_size <- nrow(tax_df)
+  tax_df <- tax_df[sample(nrow(tax_df), min(n_species, nrow(tax_df)), replace = FALSE), ]
+  cat("⚠ TESTING MODE: Subsampled to", nrow(tax_df), "species from", original_size, "\n\n")
+}
+```
+
+### GET SPECIES REPRESENTATIVES FOR MISSING CLADES (optional)
+```{r getMissingClades_optional}
+if (include_missing_clades == "yes") {
+  
+  cat("--------------------------------------------------\n")
+  cat("FINDING MISSING CLADE REPRESENTATIVES\n")
+  cat("--------------------------------------------------\n")
+  
+  # Validate clade list file
+  if (!file.exists(clade_list_file)) {
+    stop("Clade list file not found: ", clade_list_file)
+  }
+  
+  clade_list <- read.csv(clade_list_file, header = TRUE)
+  setDT(clade_list)
+  
+  cat("✓ Clade list loaded:", nrow(clade_list), "total clades\n")
+  
+  # Subset for testing
+  if (subset_for_testing == "yes") {
+    clade_list <- clade_list[sample(nrow(clade_list), min(n_clades, nrow(clade_list)), replace = FALSE), ]
+    cat("⚠ TESTING MODE: Subsampled to", nrow(clade_list), "clades\n")
+  }
+  
+  # Identify missing clades
+  clades_tax_df <- unique(tax_df[[clade_level]])
+  clade_uniques <- clade_list[!duplicated(clade_list[, ..clade_level]), ]
+  clades_missing <- clade_uniques[!(get(clade_level) %in% clades_tax_df), 
+                                  .(superkingdom, kingdom, phylum, class, order)]
+  
+  cat("✓ Identified", nrow(clades_missing), "missing", clade_level, "clades\n")
+  
+  if (nrow(clades_missing) > 0) {
+    # Find sequences for missing clades
+    clade_seqs <- suppressWarnings({
+      process_missing_clades(
+        clades_missing = clades_missing,
+        locus_searchterm = locus_searchterm,
+        rank_column = clade_level,
+        max_species_per_clade = max_species_per_clade,
+        log_file = log_file
+      )
+    })
+    
+    if (!is.null(clade_seqs) && nrow(clade_seqs) > 0) {
+      cat("\n✓ Found sequences for", nrow(clade_seqs), "clade representatives\n")
+    } else {
+      cat("\n⚠ No sequences found for missing clades\n")
+      clade_seqs <- NULL
+    }
+  } else {
+    cat("✓ All clades already represented in species list\n")
+    clade_seqs <- NULL
+  }
+  
+  cat("\n")
+}
+```
+
+### SEARCH ENTREZ FOR ACCESSIONS
+```{r search_species_accessions}
+cat("--------------------------------------------------\n")
+cat("SEARCHING GENBANK FOR ACCESSIONS\n")
+cat("--------------------------------------------------\n")
+
+setDT(tax_df)
+
+cat("Searching GenBank for", nrow(tax_df), "species\n")
+cat("This may take several minutes...\n\n")
+
+# Progress tracking
+start_time <- Sys.time()
+results_list <- vector("list", nrow(tax_df))
+
+for (i in 1:nrow(tax_df)) {
+  # Progress indicator
+  if (i %% 10 == 0 || i == nrow(tax_df)) {
+    elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+    rate <- i / elapsed
+    remaining <- (nrow(tax_df) - i) / rate
+    cat(sprintf("\r  Progress: %d/%d (%.1f%%) | Elapsed: %.1f min | Est. remaining: %.1f min   ",
+                i, nrow(tax_df), (i/nrow(tax_df))*100, elapsed, remaining))
+  }
+  
+  results_list[[i]] <- search_species_accessions(
+    species_row = tax_df[i, ],
+    locus_searchterm = locus_searchterm,
+    delay = 0.35,
+    log_file = log_file
+  )
+}
+
+cat("\n\n")
+
+# Convert to data frame
+results_df <- rbindlist(lapply(results_list, function(x) {
+  data.frame(
+    n_mitogenome = x$n_mitogenome,
+    ids_mitogenome = x$ids_mitogenome,
+    n_target = x$n_target,
+    ids_target = x$ids_target,
+    stringsAsFactors = FALSE
+  )
+}), fill = TRUE)
+
+# Add to tax_df
+tax_df[, `:=`(
+  n_mitogenome = as.numeric(results_df$n_mitogenome),
+  ids_mitogenome = results_df$ids_mitogenome,
+  n_target = as.numeric(results_df$n_target),
+  ids_target = results_df$ids_target
+)]
+
+# Summary statistics
+n_with_mito <- tax_df[n_mitogenome > 0, .N]
+n_with_target <- tax_df[n_target > 0, .N]
+n_with_either <- tax_df[n_mitogenome > 0 | n_target > 0, .N]
+
+cat("✓ Search complete!\n")
+cat("  Species with mitogenomes:", n_with_mito, "\n")
+cat("  Species with target accessions:", n_with_target, "\n")
+cat("  Species with any sequences:", n_with_either, "\n\n")
+
+# Merge with clade sequences if available
+if (include_missing_clades == "yes" && !is.null(clade_seqs) && nrow(clade_seqs) > 0) {
+  setDT(clade_seqs)
+  clade_seqs$clade_representative <- "yes"
+  tax_df$clade_representative <- "no"
+  
+  # Ensure matching columns
+  tax_df <- rbind(tax_df, clade_seqs, fill = TRUE)
+  
+  cat("✓ Added", nrow(clade_seqs), "clade representatives to dataset\n")
+  cat("  Total species in database:", nrow(tax_df), "\n\n")
+}
+
+# Save intermediate results
+fwrite(tax_df, file.path(output_folder, paste0("01_tax_accessions_", locus, "_", Sys.Date(), ".csv")))
+cat("✓ Saved: 01_tax_accessions.csv\n\n")
+```
+
+
+### FETCH ACCESSIONS
+```{r fetch_accessions}
+cat("--------------------------------------------------\n")
+cat("FETCHING SEQUENCES FROM GENBANK\n")
+cat("--------------------------------------------------\n")
+
+cat("Fetching sequences for", nrow(tax_df), "species\n")
+cat("This may take a while...\n\n")
+
+results_list <- vector("list", nrow(tax_df))
+failed_species <- data.frame(
+  species = character(),
+  status = character(),
+  row_number = integer(),
+  stringsAsFactors = FALSE
+)
+
+start_time <- Sys.time()
+
+for (i in 1:nrow(tax_df)) {
+  # Progress
+  if (i %% 5 == 0 || i == nrow(tax_df)) {
+    elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+    rate <- i / elapsed
+    remaining <- (nrow(tax_df) - i) / rate
+    cat(sprintf("\r  Progress: %d/%d (%.1f%%) | Elapsed: %.1f min | Est. remaining: %.1f min   ",
+                i, nrow(tax_df), (i/nrow(tax_df))*100, elapsed, remaining))
+  }
+  
+  result <- tryCatch({
+    fetch_species_accessions(
+      species_row = tax_df[i, ],
+      locus = locus,
+      output_folder = output_folder,
+      max_seqs = 100,
+      max_retries = 2,
+      log_file = log_file
+    )
+  }, error = function(e) {
+    species_name <- if (!is.null(tax_df[i, ]$species)) tax_df[i, ]$species else "unknown"
+    log_error(log_file, "fetch_accessions", species_name, e$message)
+    return(list(data = NULL, status = "error", species = species_name))
+  })
+  
+  # Track failures
+  if (!is.null(result$status) && result$status != "success") {
+    failed_species <- rbind(failed_species, data.frame(
+      species = ifelse(is.null(result$species), "unknown", result$species),
+      status = result$status,
+      row_number = i,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  results_list[[i]] <- result$data
+  
+  Sys.sleep(1)
+}
+
+cat("\n\n")
+
+# Combine results
+results_list <- results_list[!sapply(results_list, is.null)]
+
+if (length(results_list) == 0) {
+  warning("No sequences fetched for any species")
+  REFDB_accessions <- data.frame()
+} else {
+  REFDB_accessions <- do.call(rbind, results_list)
+  row.names(REFDB_accessions) <- NULL
+  cat("✓ Fetched", nrow(REFDB_accessions), "sequences from", length(results_list), "species\n")
+}
+
+# Report failures
+if (nrow(failed_species) > 0) {
+  cat("\n⚠", nrow(failed_species), "species failed:\n")
+  print(table(failed_species$status))
+  
+  fwrite(failed_species, file.path(output_folder, "02_failed_fetch_species.csv"))
+  cat("\n✓ Saved: 02_failed_fetch_species.csv\n")
+}
+
+cat("\n")
+```
+
+### SCRAPE TARGET LOCI FROM MITOGENOMES
+```{r scrape_mitogenomes}
+cat("--------------------------------------------------\n")
+cat("SCRAPING LOCI FROM MITOGENOMES\n")
+cat("--------------------------------------------------\n")
+
+setDT(tax_df)
+
+cat("Processing mitogenomes for", nrow(tax_df), "species\n")
+cat("This will take a while...\n\n")
+
+start_time <- Sys.time()
+n_processed <- 0
+
+REFDB_scrapes <- rbindlist(lapply(1:nrow(tax_df), function(i) {
+  # Progress
+  if (i %% 5 == 0 || i == nrow(tax_df)) {
+    elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+    rate <- i / elapsed
+    remaining <- (nrow(tax_df) - i) / rate
+    cat(sprintf("\r  Progress: %d/%d (%.1f%%) | Elapsed: %.1f min | Est. remaining: %.1f min   ",
+                i, nrow(tax_df), (i/nrow(tax_df))*100, elapsed, remaining))
+  }
+  
+  result <- process_species_mitogenomes(
+    as.list(tax_df[i, ]), 
+    target_synonyms = locus_synonyms$Name,
+    is_gene = is_mtgene,
+    max_mitos = 20,
+    log_file = log_file
+  )
+  
+  return(result)
+}), fill = TRUE)
+
+cat("\n\n")
+
+REFDB_scrapes <- REFDB_scrapes[!is.na(sequence)]
+cat("✓ Scraped", nrow(REFDB_scrapes), "sequences from mitogenomes\n\n")
+
+# Combine accessions and scrapes
+cat("Combining accession and scrape data...\n")
+REFDB_all <- rbind(REFDB_accessions, REFDB_scrapes, fill = TRUE)
+REFDB_all <- merge(REFDB_all, 
+                   tax_df[, c("superkingdom", "kingdom", "phylum", "class", 
+                             "order", "family", "genus", "species")], 
+                   by = "species", 
+                   all.x = TRUE)
+
+cat("✓ Total sequences:", nrow(REFDB_all), "\n")
+cat("  From accessions:", nrow(REFDB_accessions), "\n")
+cat("  From mitogenomes:", nrow(REFDB_scrapes), "\n\n")
+```
+
+### DEDUPLICATE REFERENCE DATABASE
+```{r remove_duplicates}
+cat("--------------------------------------------------\n")
+cat("DEDUPLICATING SEQUENCES\n")
+cat("--------------------------------------------------\n")
+
+setDT(REFDB_all)
+
+cat("Total sequences before deduplication:", nrow(REFDB_all), "\n")
+
+REFDB_unique <- REFDB_all[!duplicated(sequence)]
+
+cat("Unique sequences:", nrow(REFDB_unique), "\n")
+cat("Duplicates removed:", nrow(REFDB_all) - nrow(REFDB_unique), "\n\n")
+
+# Aggregate duplicate information
+cat("Aggregating duplicate information...\n")
+duplicate_summary <- REFDB_all[, .(
+  duplicate_accessions = paste(seq_accession, collapse = "|"),
+  duplicate_species = paste(unique(species), collapse = "|")
+), by = sequence]
+
+REFDB_unique <- merge(REFDB_unique, duplicate_summary, by = "sequence", all.x = TRUE)
+
+fwrite(REFDB_unique, file.path(output_folder, paste0("03_REFDB_unique_", locus, "_", Sys.Date(), ".csv")))
+cat("✓ Saved: 03_REFDB_unique.csv\n\n")
+```
+
+### OPTIONAL FILTERING BY SEQUENCE LENGTH
+```{r filterRefSeqs_optional}
+cat("--------------------------------------------------\n")
+cat("FILTERING BY SEQUENCE LENGTH (optional)\n")
+cat("--------------------------------------------------\n")
+
+pre_filter_count <- nrow(REFDB_unique)
+
+if (is.numeric(min_length)) {
+  REFDB_unique <- REFDB_unique[nchar(REFDB_unique$sequence) > min_length, ]
+  cat("✓ Removed sequences <", min_length, "bp:", pre_filter_count - nrow(REFDB_unique), "\n")
+}
+
+if (is.numeric(max_length)) {
+  before <- nrow(REFDB_unique)
+  REFDB_unique <- REFDB_unique[nchar(REFDB_unique$sequence) < max_length, ]
+  cat("✓ Removed sequences >", max_length, "bp:", before - nrow(REFDB_unique), "\n")
+}
+
+if (is.numeric(min_length) || is.numeric(max_length)) {
+  cat("  Final sequence count:", nrow(REFDB_unique), "\n\n")
+} else {
+  cat("⊘ No length filtering applied\n\n")
+}
+```
+
+### SUMMARIZE RESULTS FOR SPECIES LIST
+```{r summarize_species_list}
+cat("--------------------------------------------------\n")
+cat("SUMMARIZING RESULTS\n")
+cat("--------------------------------------------------\n")
+
+setDT(species_list)
+setDT(REFDB_unique)
+
+species_list[, species_id := paste0(matched_name2, "_", taxon_id)]
+
+# Aggregate information
+agg_info <- REFDB_unique[, .(
+  n_unique_seqs = .N,
+  n_target = sum(type == "accession"),
+  n_mitogenome = sum(type == "scrape"),
+  dup_accessions = paste(unique(unlist(strsplit(paste(duplicate_accessions, collapse = "|"), "\\|"))), 
+                        collapse = "|"),
+  dup_species = {
+    all_dup <- unlist(strsplit(paste(duplicate_species, collapse = "|"), "\\|"))
+    paste(unique(all_dup), collapse = "|")
+  },
+  dup_species_n = {
+    all_dup <- unlist(strsplit(paste(duplicate_species, collapse = "|"), "\\|"))
+    length(unique(all_dup))
+  }
+), by = species]
+
+species_summary <- merge(species_list, agg_info, 
+                        by.x = "species_id", by.y = "species", 
+                        all.x = TRUE)
+
+# Handle NAs
+species_summary[is.na(n_unique_seqs), n_unique_seqs := 0]
+species_summary[is.na(n_target), n_target := 0]
+species_summary[is.na(n_mitogenome), n_mitogenome := 0]
+species_summary[is.na(dup_accessions), dup_accessions := "na"]
+species_summary[is.na(dup_species), dup_species := "na"]
+species_summary[is.na(dup_species_n), dup_species_n := 0]
+
+species_summary[, n_all_seqs := n_mitogenome + n_target]
+
+# Summary statistics
+n_species_withnames <- nrow(species_summary)
+n_species_withNCBInames <- species_summary[data_source_title == "National Center for Biotechnology Information", .N]
+n_species_withNCBInamesANDtargets <- species_summary[data_source_title == "National Center for Biotechnology Information" & n_all_seqs > 0, .N]
+n_species_justAccessions <- species_summary[n_target > 0 & n_mitogenome == 0, .N]
+n_species_justMitogenomes <- species_summary[n_target == 0 & n_mitogenome > 0, .N]
+n_species_bothAccessionsAndMitogenomes <- species_summary[n_target > 0 & n_mitogenome > 0, .N]
+
+# Save
+fwrite(species_summary, file.path(output_folder, paste0("04_species_summary_", locus, "_", Sys.Date(), ".csv")))
+
+# Print summary
+cat("✓ Saved: 04_species_summary.csv\n\n")
+cat("SUMMARY STATISTICS:\n")
+cat("  Total species in list:", n_species_withnames, "\n")
+cat("  Species with NCBI names:", n_species_withNCBInames, "\n")
+cat("  Species with sequences:", n_species_withNCBInamesANDtargets, "\n")
+cat("  - Only accessions:", n_species_justAccessions, "\n")
+cat("  - Only mitogenomes:", n_species_justMitogenomes, "\n")
+cat("  - Both sources:", n_species_bothAccessionsAndMitogenomes, "\n\n")
+```
+
+### FORMAT FOR DADA2 (optional)
+```{r format_dada2_optional}
+if (format == "dada") {
+  
+  cat("--------------------------------------------------\n")
+  cat("FORMATTING FOR DADA2\n")
+  cat("--------------------------------------------------\n")
+  
+  REFDB_unique_dada <- merge(x = REFDB_unique, y = tax_df, by = "species", all = TRUE) 
+  REFDB_unique_dada <- REFDB_unique_dada[!is.na(REFDB_unique_dada$sequence), ]
+  
+  # Create header
+  REFDB_unique_dada[, header := paste0(
+    ">",
+    paste(
+      ifelse(is.na(kingdom.x), "", kingdom.x),
+      ifelse(is.na(phylum.x), "", phylum.x),
+      ifelse(is.na(class.x), "", class.x),
+      ifelse(is.na(order.x), "", order.x),
+      ifelse(is.na(family.x), "", family.x),
+      ifelse(is.na(genus.x), "", genus.x),
+      ifelse(is.na(species), "", species),
+      sep = ";"
+    )
+  )]
+  
+  REFDB_unique_dada <- REFDB_unique_dada[, c("header", "sequence")]
+  
+  fasta_file <- file.path(output_folder, paste0("05_REFDB_dada2_", locus, "_", Sys.Date(), ".fasta"))
+  write.table(REFDB_unique_dada, fasta_file, sep = "\n", 
+              col.names = FALSE, row.names = FALSE, quote = FALSE)
+  
+  n_unique_species <- length(unique(REFDB_unique_dada$header))
+  
+  cat("✓ Saved: 05_REFDB_dada2.fasta\n")
+  cat("  Total sequences:", nrow(REFDB_unique_dada), "\n")
+  cat("  Unique species:", n_unique_species, "\n\n")
+}
+```
+
+### FINAL SUMMARY
+```{r final_summary}
+cat("\n")
+cat("==================================================\n")
+cat("  PIPELINE COMPLETE!\n")
+cat("==================================================\n\n")
+
+cat("OUTPUT FILES:\n")
+cat("  📁", output_folder, "\n")
+cat("    ├─ error_log.txt\n")
+cat("    ├─ 01_tax_accessions.csv\n")
+if (nrow(failed_species) > 0) {
+  cat("    ├─ 02_failed_fetch_species.csv\n")
+}
+cat("    ├─ 03_REFDB_unique.csv\n")
+cat("    ├─ 04_species_summary.csv\n")
+if (format == "dada") {
+  cat("    └─ 05_REFDB_dada2.fasta\n")
+}
+
+cat("\nFINAL COUNTS:\n")
+cat("  Input species:", nrow(species_list), "\n")
+cat("  Species with sequences:", n_species_withNCBInamesANDtargets, "\n")
+cat("  Total sequences (with duplicates):", nrow(REFDB_all), "\n")
+cat("  Unique sequences:", nrow(REFDB_unique), "\n")
+
+if (nrow(failed_species) > 0) {
+  cat("\n⚠ WARNING:", nrow(failed_species), "species failed to fetch\n")
+  cat("  See 02_failed_fetch_species.csv for details\n")
+}
+
+cat("\n✓ Check error_log.txt for detailed error messages\n")
+cat("\n==================================================\n\n")
+
+# Save session info
+writeLines(capture.output(sessionInfo()), 
+          file.path(output_folder, "06_session_info.txt"))
+```

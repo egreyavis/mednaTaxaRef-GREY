@@ -2,96 +2,17 @@ library(rentrez)
 library(Biostrings)
 library(data.table)
 
-################# INPUT VALIDATION HELPERS #######################
-
-validate_species_list <- function(species_df) {
-  required_cols <- c("classification_path", "classification_path_ranks", 
-                     "classification_path_ids", "taxon_id", "species")
-  
-  missing_cols <- setdiff(required_cols, names(species_df))
-  if (length(missing_cols) > 0) {
-    stop("Species list missing required columns: ", paste(missing_cols, collapse = ", "))
-  }
-  
-  if (nrow(species_df) == 0) {
-    stop("Species list is empty")
-  }
-  
-  # Check for NA in critical columns
-  if (all(is.na(species_df$taxon_id))) {
-    stop("All taxon_ids are NA - cannot proceed")
-  }
-  
-  cat("✓ Species list validated:", nrow(species_df), "species\n")
-  return(TRUE)
-}
-
-validate_locus <- function(locus, mtDNAterms) {
-  if (!locus %in% mtDNAterms$Locus) {
-    available <- unique(mtDNAterms$Locus)
-    stop("Invalid locus '", locus, "'. Available loci:\n", 
-         paste(available, collapse = ", "))
-  }
-  cat("✓ Locus validated:", locus, "\n")
-  return(TRUE)
-}
-
-validate_entrez_key <- function() {
-  key <- Sys.getenv("ENTREZ_KEY")
-  if (key == "") {
-    warning("No ENTREZ_KEY set. API rate limited to 3 requests/second.")
-    return(FALSE)
-  }
-  cat("✓ ENTREZ key detected\n")
-  return(TRUE)
-}
-
-################# ERROR LOGGING #######################
-
-init_error_log <- function(output_folder) {
-  log_file <- file.path(output_folder, "07_error_log.txt")
-  
-  # Create log file with header
-  writeLines(c(
-    paste("Error Log -", Sys.time()),
-    paste(rep("=", 60), collapse = ""),
-    ""
-  ), log_file)
-  
-  return(log_file)
-}
-
-log_error <- function(log_file, step, species, error_msg) {
-  timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
-  log_entry <- paste0(
-    "[", timestamp, "] ",
-    "Step: ", step, " | ",
-    "Species: ", species, " | ",
-    "Error: ", error_msg, "\n"
-  )
-  cat(log_entry, file = log_file, append = TRUE)
-}
-
-################# SPECIES LIST PROCESSING #######################
-
+################# SPECIES LIST PROCESSING
+# Helper function to add taxid to taxonomy
 add_taxids_to_taxonomy <- function(species_df) {
   
-  # Validate input
-  validate_species_list(species_df)
-  
   setDT(species_df)
-  
-  cat("Processing taxonomy for", nrow(species_df), "species...\n")
   
   # Function to get taxid for a rank
   get_rank_taxid <- function(i, rank_name) {
     path <- species_df$classification_path[i]
     path_ranks <- species_df$classification_path_ranks[i]
     path_ids <- species_df$classification_path_ids[i]
-    
-    if (is.na(path) || is.na(path_ranks) || is.na(path_ids)) {
-      return(NA_character_)
-    }
     
     names <- strsplit(path, "\\|")[[1]]
     ranks <- strsplit(path_ranks, "\\|")[[1]]
@@ -117,9 +38,6 @@ add_taxids_to_taxonomy <- function(species_df) {
     species = rep(NA_character_, nrow(species_df))
   )
   
-  # Progress bar
-  pb <- txtProgressBar(min = 0, max = nrow(species_df), style = 3)
-  
   for (i in 1:nrow(species_df)) {
     
     # For each taxonomic rank
@@ -139,16 +57,12 @@ add_taxids_to_taxonomy <- function(species_df) {
     if (!is.na(species_name) && species_name != "na" && species_name != "") {
       result[i, species := paste0(species_name, "_", species_df$taxon_id[i])]
     }
-    
-    setTxtProgressBar(pb, i)
   }
-  
-  close(pb)
-  cat("\n✓ Taxonomy processing complete\n")
   
   return(result)
 }
 
+# Backfill taxonomy ranks that are NA
 backfill_missing_ranks <- function(taxonomy_df) {
   
   setDT(taxonomy_df)
@@ -160,6 +74,7 @@ backfill_missing_ranks <- function(taxonomy_df) {
       current_rank <- rank_hierarchy[j]
       next_rank <- rank_hierarchy[j + 1]
       
+      # If current rank is NA but next rank exists
       current_val <- taxonomy_df[i, get(current_rank)]
       next_val <- taxonomy_df[i, get(next_rank)]
       
@@ -172,20 +87,19 @@ backfill_missing_ranks <- function(taxonomy_df) {
   return(taxonomy_df)
 }
 
-########### ACCESSION FINDING WITH ERROR TRACKING #######################
-
-search_species_accessions <- function(species_row, locus_searchterm, delay = 0.35, log_file = NULL) {
+########### ACCESSION FINDING AND FETCHING FUNCTIONS #######################
+# Function to search Genbank for accessions by species and locus
+search_species_accessions <- function(species_row, locus_searchterm, delay = 0.35) {
   
+  # Extract taxid from species field (format: "Species name_taxid")
   species_info <- species_row$species
   
   # Split to get taxid
   taxid <- strsplit(species_info, "_")[[1]]
-  taxid <- taxid[length(taxid)]
+  taxid <- taxid[length(taxid)]  # Get last element in case species name has underscores
   
   if (is.na(taxid) || taxid == "" || taxid == "na") {
-    if (!is.null(log_file)) {
-      log_error(log_file, "search_accessions", species_info, "Invalid taxid")
-    }
+    warning(paste("No valid taxid found for", species_info))
     return(list(
       n_mitogenome = 0,
       ids_mitogenome = NA_character_,
@@ -194,7 +108,7 @@ search_species_accessions <- function(species_row, locus_searchterm, delay = 0.3
     ))
   }
   
-  # Format search terms
+  # Format search terms using taxid
   search_term <- paste0("txid", taxid, "[Organism]")
   mito_term <- paste(search_term, "AND mitochondrion[TITL] AND complete genome[TITL]")
   target_term <- paste(search_term, locus_searchterm)
@@ -210,9 +124,7 @@ search_species_accessions <- function(species_row, locus_searchterm, delay = 0.3
   mitogenomes <- tryCatch({
     entrez_search(db = "nucleotide", term = mito_term, retmax = 9999)
   }, error = function(e) {
-    if (!is.null(log_file)) {
-      log_error(log_file, "search_mitogenomes", species_info, e$message)
-    }
+    warning(paste("Mitogenome search failed for taxid", taxid, ":", e$message))
     return(NULL)
   })
   
@@ -225,13 +137,11 @@ search_species_accessions <- function(species_row, locus_searchterm, delay = 0.3
   
   Sys.sleep(delay)
   
-  # Search for target locus
+  # Search for target locus accessions
   targets <- tryCatch({
     entrez_search(db = "nucleotide", term = target_term, retmax = 9999)
   }, error = function(e) {
-    if (!is.null(log_file)) {
-      log_error(log_file, "search_targets", species_info, e$message)
-    }
+    warning(paste("Target search failed for taxid", taxid, ":", e$message))
     return(NULL)
   })
   
@@ -245,35 +155,35 @@ search_species_accessions <- function(species_row, locus_searchterm, delay = 0.3
   return(result)
 }
 
-fetch_species_accessions <- function(species_row, locus, output_folder, max_seqs = 100, max_retries = 2, log_file = NULL) {
+# Function to fetch species accessions with failure tracking
+fetch_species_accessions <- function(species_row, locus, output_folder, max_seqs = 100, max_retries = 2) {
   
   species_name <- species_row$species
-  n_target <- as.numeric(species_row$n_target)
+  n_target <- species_row$n_target
   ids_target <- species_row$ids_target
   
   # Skip if no targets
   if (is.na(n_target) || n_target == 0 || is.na(ids_target)) {
-    return(list(data = NULL, status = "no_targets", species = species_name))
+    return(list(data = NULL, status = "no_targets"))
   }
   
   # Parse IDs
   ids <- unlist(strsplit(ids_target, split = "\\|"))
   
-  # Subsample if needed
+  # Subsample if > max_seqs
   if (length(ids) > max_seqs) {
     ids <- sample(ids, max_seqs)
   }
   
-  # Fetch sequences with retry
+  # Fetch sequences with retry logic
   seqs_target <- NULL
   for (attempt in 1:max_retries) {
     seqs_target <- tryCatch({
       entrez_fetch(db = "nuccore", id = ids, rettype = "fasta")
     }, error = function(e) {
       if (attempt < max_retries) {
-        Sys.sleep(2)
-      } else if (!is.null(log_file)) {
-        log_error(log_file, "fetch_sequences", species_name, e$message)
+        message(paste("Attempt", attempt, "failed for", species_name, "- retrying..."))
+        Sys.sleep(2)  # Wait before retry
       }
       return(NULL)
     })
@@ -285,47 +195,34 @@ fetch_species_accessions <- function(species_row, locus, output_folder, max_seqs
     return(list(data = NULL, status = "fetch_failed", species = species_name))
   }
   
-  # Write fasta
-  fasta_file <- file.path(output_folder, paste(gsub("[^A-Za-z0-9_-]", "_", species_name), paste0(locus, ".fasta")))
+  # Write and read back sequences
+  fasta_file <- file.path(output_folder, paste(species_name, paste0(locus, ".fasta")))
   
-  write_success <- tryCatch({
+  tryCatch({
     write(seqs_target, fasta_file)
-    TRUE
   }, error = function(e) {
-    if (!is.null(log_file)) {
-      log_error(log_file, "write_fasta", species_name, e$message)
-    }
-    return(FALSE)
+    return(list(data = NULL, status = "write_failed", species = species_name))
   })
   
-  if (!write_success) {
-    return(list(data = NULL, status = "write_failed", species = species_name))
-  }
-  
-  # Read fasta
   fasta_target <- tryCatch({
     readDNAStringSet(fasta_file, format = "fasta")
   }, error = function(e) {
-    if (!is.null(log_file)) {
-      log_error(log_file, "read_fasta", species_name, e$message)
-    }
-    return(NULL)
+    return(list(data = NULL, status = "read_failed", species = species_name))
   })
   
   if (is.null(fasta_target) || length(fasta_target) == 0) {
     return(list(data = NULL, status = "empty_fasta", species = species_name))
   }
   
-  # Fetch accessions with retry
+  # Fetch accession numbers with retry
   seqs_target_accessions <- NULL
   for (attempt in 1:max_retries) {
     seqs_target_accessions <- tryCatch({
       entrez_fetch(db = "nuccore", id = ids, rettype = "acc")
     }, error = function(e) {
       if (attempt < max_retries) {
+        message(paste("Attempt", attempt, "failed fetching accessions for", species_name, "- retrying..."))
         Sys.sleep(2)
-      } else if (!is.null(log_file)) {
-        log_error(log_file, "fetch_accessions", species_name, e$message)
       }
       return(NULL)
     })
@@ -342,18 +239,18 @@ fetch_species_accessions <- function(species_row, locus, output_folder, max_seqs
   sequence <- as.character(fasta_target)
   seq_accession <- unlist(strsplit(seqs_target_accessions, split = "\n"))
   
-  # Length validation
+  # Check that lengths match
   n_seqs <- length(seq_header)
   n_accs <- length(seq_accession)
   
   if (n_seqs != n_accs) {
+    warning(paste(
+      "Mismatch for", species_name, "- Sequences:", n_seqs, "Accessions:", n_accs
+    ))
+    
     min_len <- min(n_seqs, n_accs)
     
     if (min_len == 0) {
-      if (!is.null(log_file)) {
-        log_error(log_file, "length_mismatch", species_name, 
-                  paste("Sequences:", n_seqs, "Accessions:", n_accs))
-      }
       return(list(data = NULL, status = "length_mismatch", species = species_name))
     }
     
@@ -375,39 +272,12 @@ fetch_species_accessions <- function(species_row, locus, output_folder, max_seqs
   return(list(data = result_df, status = "success", species = species_name))
 }
 
-########### MISSING CLADES - OPTIMIZED #######################
-
-# Batch taxonomy fetching (more efficient than one-by-one)
-batch_extract_taxonomy <- function(species_ids, batch_size = 50) {
-  
-  n_species <- length(species_ids)
-  n_batches <- ceiling(n_species / batch_size)
-  
-  all_results <- vector("list", n_species)
-  
-  for (batch in 1:n_batches) {
-    start_idx <- (batch - 1) * batch_size + 1
-    end_idx <- min(batch * batch_size, n_species)
-    batch_ids <- species_ids[start_idx:end_idx]
-    
-    cat("\r  Fetching taxonomy batch", batch, "of", n_batches, "        ")
-    
-    # Fetch batch
-    for (id in batch_ids) {
-      idx <- which(species_ids == id)
-      all_results[[idx]] <- extract_taxonomy(id)
-      Sys.sleep(0.35)
-    }
-  }
-  
-  cat("\n")
-  return(all_results)
-}
-
-# (Keep all other missing clade functions as they were - they're already good)
+########### ADD MISSING CLADE MITOGENOMES AND ACCESSIONS (optional) ###########
+# Function to get species list for a clade using NCBI Taxonomy
 get_clade_species <- function(clade_id, max_species = 1000) {
   
   tryCatch({
+    # Search for all species under this taxon
     search_result <- entrez_search(
       db = "taxonomy",
       term = paste0("txid", clade_id, "[Subtree] AND species[Rank]"),
@@ -415,6 +285,7 @@ get_clade_species <- function(clade_id, max_species = 1000) {
     )
     
     if (length(search_result$ids) == 0) {
+      warning(paste("No species found for clade", clade_id))
       return(NULL)
     }
     
@@ -427,11 +298,14 @@ get_clade_species <- function(clade_id, max_species = 1000) {
   })
 }
 
+# Improved function to extract taxonomy for clade species with better XML parsing
 extract_taxonomy <- function(species_id) {
   
+  # Fetch full classification using efetch
   classification <- tryCatch({
     entrez_fetch(db = "taxonomy", id = species_id, rettype = "xml")
   }, error = function(e) {
+    warning(paste("Failed to fetch taxonomy for", species_id))
     return(NULL)
   })
   
@@ -440,18 +314,23 @@ extract_taxonomy <- function(species_id) {
                 species = NA, species_id = species_id))
   }
   
+  # Initialize results
   family <- NA
   family_id <- NA
   genus <- NA
   genus_id <- NA
   species <- NA
   
+  # Split into lines for parsing
   lines <- strsplit(classification, "\n")[[1]]
   
+  # Find each Lineage entry with Rank and extract name and TaxId
   i <- 1
   while (i <= length(lines)) {
     
+    # Look for family rank
     if (grepl("<Rank>family</Rank>", lines[i])) {
+      # Search backwards and forwards for ScientificName and TaxId within same LineageEx block
       start_idx <- max(1, i - 15)
       end_idx <- min(length(lines), i + 5)
       
@@ -467,6 +346,7 @@ extract_taxonomy <- function(species_id) {
       }
     }
     
+    # Look for genus rank
     if (grepl("<Rank>genus</Rank>", lines[i])) {
       start_idx <- max(1, i - 15)
       end_idx <- min(length(lines), i + 5)
@@ -483,6 +363,7 @@ extract_taxonomy <- function(species_id) {
       }
     }
     
+    # Look for species rank - the main ScientificName at the top
     if (grepl("<Rank>species</Rank>", lines[i]) && is.na(species)) {
       start_idx <- max(1, i - 15)
       
@@ -498,6 +379,7 @@ extract_taxonomy <- function(species_id) {
     i <- i + 1
   }
   
+  # If species is still NA, try to get it from the main taxonomy record
   if (is.na(species)) {
     for (line in lines) {
       if (grepl("^\\s*<ScientificName>", line)) {
@@ -518,6 +400,7 @@ extract_taxonomy <- function(species_id) {
   ))
 }
 
+# Function to search for sequences (mitogenome first, then target)
 search_species_sequences <- function(species_id, locus_searchterm) {
   
   tax_query <- paste0("txid", species_id, "[Organism]")
@@ -529,6 +412,7 @@ search_species_sequences <- function(species_id, locus_searchterm) {
     found = FALSE
   )
   
+  # Try mitogenome first
   mitogenomes <- tryCatch({
     entrez_search(
       db = "nucleotide",
@@ -545,6 +429,7 @@ search_species_sequences <- function(species_id, locus_searchterm) {
     return(result)
   }
   
+  # If no mitogenome, try target locus
   targets <- tryCatch({
     entrez_search(
       db = "nucleotide",
@@ -563,28 +448,71 @@ search_species_sequences <- function(species_id, locus_searchterm) {
   return(result)
 }
 
+# Function to get taxonomy for species IDs
+get_taxonomy_info <- function(species_ids) {
+  
+  if (length(species_ids) == 0) {
+    return(NULL)
+  }
+  
+  # Fetch taxonomy summaries
+  tax_summaries <- tryCatch({
+    entrez_summary(db = "taxonomy", id = species_ids)
+  }, error = function(e) {
+    warning("Failed to fetch taxonomy summaries")
+    return(NULL)
+  })
+  
+  if (is.null(tax_summaries)) {
+    return(NULL)
+  }
+  
+  # Parse taxonomy for each species
+  tax_list <- lapply(species_ids, function(id) {
+    
+    summary <- if (length(species_ids) == 1) {
+      tax_summaries
+    } else {
+      tax_summaries[[as.character(id)]]
+    }
+    
+    # Extract lineage information
+    lineage <- summary$lineage
+    sci_name <- summary$scientificname
+    tax_id <- summary$taxid
+    
+    # Parse lineage to get family and genus
+    lineage_parts <- strsplit(lineage, "; ")[[1]]
+    
+    list(
+      species_id = id,
+      scientific_name = sci_name,
+      lineage = lineage,
+      lineage_parts = lineage_parts
+    )
+  })
+  
+  return(tax_list)
+}
+
+# Maine process missing clades function
 process_missing_clades <- function(clades_missing, 
                                    locus_searchterm,
                                    rank_column = "order",
-                                   max_species_per_clade = 3,
-                                   log_file = NULL) {
+                                   max_species_per_clade = 3) {
   
   setDT(clades_missing)
   
-  cat("\nProcessing", nrow(clades_missing), "missing clades at rank:", rank_column, "\n")
+  cat("Processing", nrow(clades_missing), "missing clades at rank:", rank_column, "\n")
   
   all_results <- list()
-  failed_clades <- data.frame(
-    clade = character(),
-    reason = character(),
-    stringsAsFactors = FALSE
-  )
   
   for (i in 1:nrow(clades_missing)) {
     cat("\nProcessing clade", i, "of", nrow(clades_missing), ":")
     
     clade_row <- clades_missing[i, ]
     
+    # Extract clade ID
     clade_info <- clade_row[[rank_column]]
     clade_parts <- strsplit(clade_info, "_")[[1]]
     clade_id <- clade_parts[length(clade_parts)]
@@ -594,31 +522,20 @@ process_missing_clades <- function(clades_missing,
     
     if (is.na(clade_id) || clade_id == "") {
       cat(" - No clade ID\n")
-      failed_clades <- rbind(failed_clades, data.frame(
-        clade = clade_name,
-        reason = "no_clade_id",
-        stringsAsFactors = FALSE
-      ))
       next
     }
     
+    # Get species list
     species_ids <- get_clade_species(clade_id, max_species = 1000)
     
     if (is.null(species_ids) || length(species_ids) == 0) {
       cat(" - No species found\n")
-      failed_clades <- rbind(failed_clades, data.frame(
-        clade = clade_name,
-        reason = "no_species_found",
-        stringsAsFactors = FALSE
-      ))
-      if (!is.null(log_file)) {
-        log_error(log_file, "process_clades", clade_name, "No species found")
-      }
       next
     }
     
     Sys.sleep(0.35)
     
+    # Randomize and search
     species_ids <- sample(species_ids)
     finds <- 0
     max_to_search <- min(length(species_ids), max_species_per_clade * 10)
@@ -633,10 +550,12 @@ process_missing_clades <- function(clades_missing,
       if (result$found) {
         cat("\n  Found sequences for species", species_ids[j])
         
+        # Get taxonomy
         tax_info <- extract_taxonomy(species_ids[j])
         
         Sys.sleep(0.35)
         
+        # Create result row with n_mitogenome and n_target as numeric
         result_row <- data.table(
           superkingdom = clade_row$superkingdom,
           kingdom = clade_row$kingdom,
@@ -652,9 +571,9 @@ process_missing_clades <- function(clades_missing,
           species = ifelse(!is.na(tax_info$species),
                            paste0(tax_info$species, "_", species_ids[j]),
                            NA_character_),
-          n_mitogenome = ifelse(!is.na(result$mito_id), 1, 0),
+          n_mitogenome = ifelse(!is.na(result$mito_id), 1, 0),  # Numeric: 1 if found, 0 if not
           ids_mitogenome = ifelse(!is.na(result$mito_id), as.character(result$mito_id), NA_character_),
-          n_target = ifelse(!is.na(result$target_id), 1, 0),
+          n_target = ifelse(!is.na(result$target_id), 1, 0),  # Numeric: 1 if found, 0 if not
           ids_target = ifelse(!is.na(result$target_id), as.character(result$target_id), NA_character_),
           species_id = as.character(species_ids[j]),
           tax_query = paste0("txid", species_ids[j])
@@ -666,23 +585,9 @@ process_missing_clades <- function(clades_missing,
     }
     
     cat("\n  Total found for", clade_name, ":", finds, "\n")
-    
-    if (finds == 0) {
-      failed_clades <- rbind(failed_clades, data.frame(
-        clade = clade_name,
-        reason = "no_sequences_found",
-        stringsAsFactors = FALSE
-      ))
-    }
   }
   
-  cat("\n\n✓ Clade processing complete!\n")
-  
-  # Report failures
-  if (nrow(failed_clades) > 0) {
-    cat("\n", nrow(failed_clades), "clades failed:\n")
-    print(table(failed_clades$reason))
-  }
+  cat("\n\nComplete!\n")
   
   if (length(all_results) == 0) {
     warning("No sequences found for any clades")
@@ -693,9 +598,9 @@ process_missing_clades <- function(clades_missing,
   return(clade_seqs)
 }
 
-############# MITOGENOME SCRAPING #######################
 
-# (Keep all mitogenome scraping functions as they were - already good)
+############# MITOGENOME SCRAPING FUNCTIONS #######################
+# Fetch GenBank record and extract sequence for a specific feature
 extract_mito_feature <- function(accession, target_synonyms, is_gene = TRUE) {
   
   result <- list(
@@ -706,11 +611,13 @@ extract_mito_feature <- function(accession, target_synonyms, is_gene = TRUE) {
   )
   
   tryCatch({
+    # Fetch GenBank record in gbwithparts format (includes features and sequence)
     gb_text <- entrez_fetch(db = "nuccore", 
-                            id = accession,
-                            rettype = "gbwithparts", 
-                            retmode = "text")
+                           id = accession,
+                           rettype = "gbwithparts", 
+                           retmode = "text")
     
+    # Parse the record
     parsed <- parse_genbank_feature(gb_text, target_synonyms, is_gene)
     
     if (!is.null(parsed$sequence)) {
@@ -725,37 +632,45 @@ extract_mito_feature <- function(accession, target_synonyms, is_gene = TRUE) {
   return(result)
 }
 
+# Parse GenBank text and extract feature sequence
 parse_genbank_feature <- function(gb_text, target_synonyms, is_gene = TRUE) {
   
   lines <- strsplit(gb_text, "\n")[[1]]
   
+  # Determine feature type to search for
   feature_types <- if (is_gene) {
     c("gene", "CDS")
   } else {
     c("rRNA", "tRNA", "misc_RNA")
   }
   
+  # Find the target feature
   feature_info <- find_target_feature(lines, target_synonyms, feature_types)
   
   if (is.null(feature_info)) {
     return(list(sequence = NULL, feature_name = NULL))
   }
   
+  # Extract the full sequence from ORIGIN section
   origin_start <- which(grepl("^ORIGIN", lines))
   if (length(origin_start) == 0) {
     return(list(sequence = NULL, feature_name = NULL))
   }
   
+  # Get sequence lines (after ORIGIN, before //)
   seq_lines <- lines[(origin_start + 1):length(lines)]
   seq_lines <- seq_lines[!grepl("^//", seq_lines)]
   
+  # Clean and concatenate sequence
   full_sequence <- paste(gsub("[^acgtACGT]", "", seq_lines), collapse = "")
   full_sequence <- DNAString(full_sequence)
   
+  # Extract the target subsequence
   target_seq <- subseq(full_sequence, 
                        start = feature_info$start, 
                        end = feature_info$end)
   
+  # Handle complement if needed
   if (feature_info$complement) {
     target_seq <- reverseComplement(target_seq)
   }
@@ -766,19 +681,23 @@ parse_genbank_feature <- function(gb_text, target_synonyms, is_gene = TRUE) {
   ))
 }
 
+# Find target feature in GenBank lines
 find_target_feature <- function(lines, target_synonyms, feature_types) {
   
   for (i in seq_along(lines)) {
     line <- lines[i]
     
+    # Check if this is a feature of interest
     is_target_feature <- any(sapply(feature_types, function(ft) {
       grepl(paste0("^\\s{5}", ft, "\\s+"), line)
     }))
     
     if (!is_target_feature) next
     
+    # Extract location from first line
     location_info <- extract_location(line)
     
+    # Look ahead for gene/product name
     feature_block <- lines[i:min(i + 20, length(lines))]
     gene_name <- extract_gene_name(feature_block, target_synonyms)
     
@@ -795,9 +714,11 @@ find_target_feature <- function(lines, target_synonyms, feature_types) {
   return(NULL)
 }
 
+# Extract location coordinates
 extract_location <- function(line) {
   complement <- grepl("complement", line)
   
+  # Extract coordinate range - handle various formats
   coords <- regmatches(line, regexpr("\\d+\\.\\.\\d+", line))
   
   if (length(coords) == 0) {
@@ -813,18 +734,22 @@ extract_location <- function(line) {
   )
 }
 
+# Extract gene name from feature block
 extract_gene_name <- function(feature_block, target_synonyms) {
   
+  # Look for /gene= or /product=
   gene_line <- grep('/gene=|/product=', feature_block, value = TRUE)
   
   if (length(gene_line) == 0) return(NA)
   
+  # Extract the quoted value
   gene_match <- regexpr('"[^"]+"', gene_line[1])
   if (gene_match[1] == -1) return(NA)
   
   gene_value <- regmatches(gene_line[1], gene_match)
   gene_value <- gsub('"', '', gene_value)
   
+  # Check if it matches any synonym (ONE AT A TIME)
   for (syn in target_synonyms) {
     if (grepl(syn, gene_value, ignore.case = TRUE)) {
       return(gene_value)
@@ -834,29 +759,35 @@ extract_gene_name <- function(feature_block, target_synonyms) {
   return(NA)
 }
 
-process_species_mitogenomes <- function(species_row, target_synonyms, is_gene = TRUE, max_mitos = 20, log_file = NULL) {
+# Function to process species mitogenomes
+process_species_mitogenomes <- function(species_row, target_synonyms, is_gene = TRUE, max_mitos = 20) {
   
+  # Extract values and convert to proper types
   species_name <- as.character(species_row$species)
-  n_mitogenomes <- as.numeric(species_row$n_mitogenome)
+  n_mitogenomes <- as.numeric(species_row$n_mitogenome)  # Convert character to numeric
   ids_mitogenome <- as.character(species_row$ids_mitogenome)
   
+  cat("\rProcessing:", species_name, "with", n_mitogenomes, "mitogenomes")
+  
+  # Skip if no mitogenomes - now checks numeric properly
   if (is.na(n_mitogenomes) || n_mitogenomes == 0 || is.na(ids_mitogenome) || ids_mitogenome == "") {
     return(NULL)
   }
   
+  # Parse mitogenome IDs
   mito_ids <- unlist(strsplit(ids_mitogenome, split = "\\|"))
   
+  # Subsample if > max_mitos
   if (length(mito_ids) > max_mitos) {
     mito_ids <- sample(mito_ids, max_mitos)
   }
   
+  # Fetch accessions
   mito_accessions <- tryCatch({
     acc <- entrez_fetch(mito_ids, db = "nuccore", rettype = "acc")
     unlist(strsplit(acc, split = "\n"))
   }, error = function(e) {
-    if (!is.null(log_file)) {
-      log_error(log_file, "fetch_mito_accessions", species_name, e$message)
-    }
+    warning(paste("Failed to fetch accessions for", species_name))
     return(NULL)
   })
   
@@ -864,13 +795,15 @@ process_species_mitogenomes <- function(species_row, target_synonyms, is_gene = 
     return(NULL)
   }
   
+  # Process each accession with rate limiting
   results_list <- vector("list", length(mito_accessions))
   
   for (i in seq_along(mito_accessions)) {
-    Sys.sleep(0.35)
+    Sys.sleep(0.35)  # Rate limiting
     
     extracted <- extract_mito_feature(mito_accessions[i], target_synonyms, is_gene)
     
+    # Only create data frame if sequence was found
     if (!is.na(extracted$sequence)) {
       results_list[[i]] <- data.frame(
         seq_header = extracted$header,
@@ -883,11 +816,15 @@ process_species_mitogenomes <- function(species_row, target_synonyms, is_gene = 
     }
   }
   
+  # Remove NULL entries
   results_list <- results_list[!sapply(results_list, is.null)]
   
   if (length(results_list) == 0) {
     return(NULL)
   }
   
+  # Combine results
   do.call(rbind, results_list)
 }
+
+
