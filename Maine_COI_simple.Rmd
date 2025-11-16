@@ -25,8 +25,10 @@ output_folder <- paste(species_list_name, locus, Sys.Date(), sep="-") #name of y
 species_list <- read.csv(paste("workingfiles/", species_list_name, ".csv", sep=""), header=TRUE) # read in the species list
 include_missing_clades <- "yes" # put yes if you want to do this, anything else will be no. If yes, fill out the variables below.
 format <- "dada" # dada for the dada2 assignTaxonomy format, anything else will not format past REFDB_uniques
-subset_for_testing <- "yes" # put yes if you want to do this, onything else will be no. If yes, fill out the variables below.
-
+subset_for_testing <- "no" # put yes if you want to do this, anything else will be no. If yes, fill out the variables below.
+min_length <- 100 # reference sequences below this length in bp will be removed, any non-numeric value like "skip" will skip this step
+max_length <- 4000 #reference sequences above this length in bp will be removed, any non-numeric value like "skip" will skip this step  
+  
 ### INCLUDE MISSING CLADE SEQUENCES?
 if (include_missing_clades == "yes") {
   clade_list <- read.csv("workingfiles/EukaryoteFamilies_NCBI_2023-09-19.csv") # list of eukaryote families in NCBI, change if necessary
@@ -270,6 +272,18 @@ fwrite(REFDB_unique, file.path(output_folder, paste0("REFDB_unique_", locus, "_"
 
 
 cat("Saved", nrow(REFDB_unique), "unique sequences\n")
+
+```
+
+## Optional Filtering by Sequence Length
+```{r filterRefSeqs_optional}
+if (is.numeric(min_length)) {
+  REFDB_unique = REFDB_unique[nchar(REFDB_unique$sequence) > min_length,]
+  }
+
+if (is.numeric(max_length)) {
+  REFDB_unique = REFDB_unique[nchar(REFDB_unique$sequence) < max_length,]
+  }
 
 ```
 
